@@ -92,7 +92,13 @@ function getAudioContext(): AudioContext {
   if (sharedAudioCtx) return sharedAudioCtx;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const Ctor = (window as any).AudioContext || (window as any).webkitAudioContext;
-  sharedAudioCtx = new Ctor();
+  // `latencyHint: "playback"` tells the OS this is media playback,
+  // not low-latency interactive audio. On Windows / WebView2 this
+  // bypasses the "communications" DSP chain (AGC, noise-suppression,
+  // echo-cancellation) that would otherwise color the output.
+  // `sampleRate: 48000` matches the rate Asuna v4 outputs, avoiding
+  // a mandatory resample step.
+  sharedAudioCtx = new Ctor({ latencyHint: 'playback', sampleRate: 48000 });
   return sharedAudioCtx as AudioContext;
 }
 
