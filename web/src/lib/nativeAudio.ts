@@ -32,11 +32,18 @@ export function nativeAudioAvailable(): boolean {
 }
 
 /** Play a chunk of WAV bytes through Tauri's native rodio backend.
- *  All chunks of the same `turnId` queue into one continuous sink. */
-export async function playAudioNative(audioB64: string, turnId: string): Promise<void> {
+ *  All chunks of the same `turnId` queue into one continuous sink.
+ *  `seq` is the 0-based chunk index — the rodio worker drops repeats
+ *  of the same (turnId, seq) so we don't double-play when the avatar
+ *  overlay window AND the main window both receive the broadcast. */
+export async function playAudioNative(
+  audioB64: string,
+  turnId: string,
+  seq: number,
+): Promise<void> {
   const invoke = tauriInvoke();
   if (!invoke) throw new Error('not running under Tauri');
-  await invoke('play_audio_native', { audioB64, turnId });
+  await invoke('play_audio_native', { audioB64, turnId, seq });
 }
 
 /** Interrupt any in-flight native playback (drops the queue). */

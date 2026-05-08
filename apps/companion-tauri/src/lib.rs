@@ -23,7 +23,17 @@ struct ServerProcess(Mutex<Option<CommandChild>>);
 /// command sender — `Send + Sync` — and the worker owns the stream,
 /// sink, and current-turn id.
 enum AudioCmd {
-    Play { wav_bytes: Vec<u8>, turn_id: String },
+    Play {
+        wav_bytes: Vec<u8>,
+        turn_id: String,
+        /// 0-based chunk index within this turn. Combined with turn_id
+        /// it identifies a unique audio chunk; duplicate (turn_id, seq)
+        /// pairs are dropped so multiple windows / multiple WS clients
+        /// don't queue the same audio twice into the rodio Sink (which
+        /// would play it twice — the symptom users heard as "she said
+        /// the sentence twice").
+        seq: u32,
+    },
     Stop,
 }
 
@@ -54,19 +64,38 @@ fn run_audio_worker(rx: std::sync::mpsc::Receiver<AudioCmd>) {
     };
     let mut current_turn: Option<String> = None;
     let mut sink: Option<rodio::Sink> = None;
+    // (turn_id, seq) of chunks already appended to the current sink.
+    // Multiple windows / multiple WS clients each fire `play_audio_native`
+    // for the same broadcast Audio frame; without this dedupe set we
+    // append the same WAV to the sink twice (or more) and rodio plays
+    // it back twice. Cleared on turn change so we don't grow forever.
+    let mut seen_chunks: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
             AudioCmd::Stop => {
                 sink = None;
                 current_turn = None;
+                seen_chunks.clear();
             }
-            AudioCmd::Play { wav_bytes, turn_id } => {
+            AudioCmd::Play {
+                wav_bytes,
+                turn_id,
+                seq,
+            } => {
                 if current_turn.as_deref() != Some(&turn_id) {
                     // New turn — drop the previous sink (and its queue)
                     // so we don't carry over chunks from a stale reply.
                     sink = None;
-                    current_turn = Some(turn_id);
+                    seen_chunks.clear();
+                    current_turn = Some(turn_id.clone());
+                }
+                if !seen_chunks.insert(seq) {
+                    tracing::debug!(
+                        "companion-audio: dropping duplicate chunk turn={turn_id} seq={seq} \
+                         (likely fanout from multiple WS clients)"
+                    );
+                    continue;
                 }
                 if sink.is_none() {
                     sink = match rodio::Sink::try_new(&handle) {
@@ -228,6 +257,7 @@ fn play_audio_native(
     state: tauri::State<'_, AudioState>,
     audio_b64: String,
     turn_id: String,
+    seq: u32,
 ) -> Result<(), String> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
@@ -238,6 +268,7 @@ fn play_audio_native(
         .send(AudioCmd::Play {
             wav_bytes: bytes,
             turn_id,
+            seq,
         })
         .map_err(|e| format!("audio worker gone: {e}"))
 }

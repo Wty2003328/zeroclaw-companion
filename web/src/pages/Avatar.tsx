@@ -288,7 +288,7 @@ export default function Avatar() {
       const match = modelActions.motions.find((m) => m.group === group);
       if (match) viewerRef.current?.playMotion(match.group, match.index);
     },
-    onAudio: (audioBase64, _format, _sampleRate, lipSync, turnId, _seq, last) => {
+    onAudio: (audioBase64, _format, _sampleRate, lipSync, turnId, seq, last) => {
       // New turn → flush both the WebView queue AND the native sink.
       if (turnId && turnId !== currentTurnRef.current) {
         stopCurrentAudio();
@@ -311,7 +311,7 @@ export default function Avatar() {
       // process's WASAPI session, which Windows classifies as
       // multimedia. Bypasses WebView2's "communications" DSP.
       if (nativeAudioAvailable()) {
-        void playAudioNative(audioBase64, turnId).then(() => {
+        void playAudioNative(audioBase64, turnId, seq).then(() => {
           // rodio's Sink doesn't emit a JS-visible "ended" event; we
           // optimistically drop "speaking" state when the last chunk
           // has been queued. The Sink will play through its queue.
