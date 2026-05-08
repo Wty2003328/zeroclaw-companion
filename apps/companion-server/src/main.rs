@@ -94,10 +94,22 @@ async fn main() -> Result<()> {
     }
 
     // Serve the companion web bundle (Vite build output).
+    //
+    // The frontend is a React SPA with client-side routing (BrowserRouter
+    // — `/avatar`, `/pulse`, etc. are handled by React, not by files on
+    // disk). For any path that doesn't match a real asset, fall through
+    // to `index.html` so React can take over. Without this, hitting
+    // `/avatar` directly in the browser would 404.
+    //
+    // ServeDir's `not_found_service` does serve index.html bytes but
+    // preserves the 404 status, which most browsers refuse to render.
+    // Use a custom axum fallback that returns 200 OK with the index body.
     let web_dir = resolve_web_dist(&cfg.server.web_dist_dir);
     if web_dir.exists() {
         tracing::info!("companion: serving web from {}", web_dir.display());
-        router = router.fallback_service(ServeDir::new(web_dir));
+        let index_path = web_dir.join("index.html");
+        let serve_dir = ServeDir::new(&web_dir).fallback(spa_fallback(index_path));
+        router = router.fallback_service(serve_dir);
     } else {
         tracing::warn!(
             "companion: web bundle not found at {}; UI will 404 until you `npm run build` in web/",
@@ -290,6 +302,42 @@ async fn run_sse_bridge(zc: ZeroclawClient, tx: broadcast::Sender<AvatarEvent>) 
         tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
     }
+}
+
+/// Return a tower service that always responds 200 with `index.html`'s
+/// bytes. ServeDir uses this as its fallback when no real asset exists
+/// at the requested path — exactly the SPA behavior React Router needs.
+fn spa_fallback(
+    index_path: std::path::PathBuf,
+) -> impl tower::Service<
+    axum::extract::Request,
+    Response = axum::response::Response,
+    Error = std::convert::Infallible,
+    Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<axum::response::Response, std::convert::Infallible>> + Send>,
+    >,
+> + Clone
++ Send
++ 'static {
+    use axum::response::IntoResponse;
+    let index_path = std::sync::Arc::new(index_path);
+    tower::service_fn(move |_req: axum::extract::Request| {
+        let p = index_path.clone();
+        Box::pin(async move {
+            let body = tokio::fs::read(p.as_path()).await.unwrap_or_default();
+            Ok::<_, std::convert::Infallible>(
+                ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], body)
+                    .into_response(),
+            )
+        })
+            as std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<axum::response::Response, std::convert::Infallible>,
+                        > + Send,
+                >,
+            >
+    })
 }
 
 async fn handle_health() -> &'static str {
