@@ -155,6 +155,7 @@ pub fn run() {
             hide_avatar_window,
             play_audio_native,
             stop_audio_native,
+            restart_app,
         ])
         .on_window_event(|window, event| {
             if matches!(event, WindowEvent::Destroyed) && window.label() == "main" {
@@ -246,4 +247,15 @@ fn play_audio_native(
 #[tauri::command]
 fn stop_audio_native(state: tauri::State<'_, AudioState>) {
     let _ = state.tx.send(AudioCmd::Stop);
+}
+
+/// Restart the Tauri host process. Used by the Settings page after the
+/// user saves a subagent override — the change takes effect on next
+/// boot because the live subagent is built once at companion-server
+/// startup and isn't hot-swappable. Tauri's `app.restart()` cleanly
+/// kills the sidecar (via the WindowEvent::Destroyed handler) before
+/// re-launching the binary.
+#[tauri::command]
+fn restart_app(app: AppHandle) {
+    app.restart();
 }

@@ -223,6 +223,14 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
         tts_text.chars().count(),
         state.event_tx.receiver_count(),
     );
+    tracing::info!(
+        "avatar: process_speak SUBTITLE = {:?}",
+        &subtitle_text[..subtitle_text.len().min(300)]
+    );
+    tracing::info!(
+        "avatar: process_speak TTS_TEXT = {:?}",
+        &tts_text[..tts_text.len().min(300)]
+    );
 
     let bcast = |frame: AvatarNotification| {
         // Send returns Err if there are zero receivers; that's fine,
@@ -277,6 +285,11 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
 
     for (i, chunk) in chunks.iter().enumerate() {
         let is_last = i + 1 == total;
+        tracing::info!(
+            "avatar: TTS chunk {}/{} ({}c, last={is_last}, turn_id={turn_id}): {:?}",
+            i + 1, total, chunk.chars().count(),
+            &chunk[..chunk.len().min(120)]
+        );
         match state.tts.synthesize_with(chunk, &tts_lang).await {
             Ok(audio) => {
                 use base64::Engine;

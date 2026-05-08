@@ -210,11 +210,21 @@ impl AvatarSubagent {
             .replace("{chat_lang}", chat_language)
             .replace("{tts_lang}", tts_language);
 
+        tracing::info!(
+            "avatar subagent: → input ({}c, chat={chat_language}, tts={tts_language}): {:?}",
+            truncated.chars().count(),
+            &truncated[..truncated.len().min(200)],
+        );
         let result =
             tokio::time::timeout(self.timeout, self.backend.ask(&system_prompt, truncated)).await;
 
         match result {
             Ok(Ok(response_text)) => {
+                tracing::info!(
+                    "avatar subagent: ← raw LLM response ({}c): {:?}",
+                    response_text.chars().count(),
+                    &response_text[..response_text.len().min(500)],
+                );
                 let cleaned = response_text
                     .trim()
                     .trim_start_matches("```json")
@@ -223,10 +233,17 @@ impl AvatarSubagent {
                     .trim();
                 match serde_json::from_str::<SubagentAnalysis>(cleaned) {
                     Ok(analysis) => {
-                        tracing::debug!(
-                            "avatar subagent: expression={} translated={}",
+                        tracing::info!(
+                            "avatar subagent: parsed expr={} clean_chat={:?} translated={:?}",
                             analysis.expression,
-                            analysis.translated_text.is_some(),
+                            analysis.clean_chat_text.as_ref().map(|s| {
+                                let n = s.chars().count();
+                                format!("{}c: {:?}", n, &s[..s.len().min(120)])
+                            }),
+                            analysis.translated_text.as_ref().map(|s| {
+                                let n = s.chars().count();
+                                format!("{}c: {:?}", n, &s[..s.len().min(120)])
+                            }),
                         );
                         Some(analysis)
                     }

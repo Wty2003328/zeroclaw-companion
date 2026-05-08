@@ -7,6 +7,15 @@ import {
   setStoredServerUrl,
 } from '../lib/apiBase';
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function tauriInvoke(): ((cmd: string, args?: Record<string, unknown>) => Promise<any>) | null {
+  if (typeof window === 'undefined') return null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const w = window as any;
+  const inv = w.__TAURI_INTERNALS__?.invoke ?? w.__TAURI__?.invoke ?? null;
+  return typeof inv === 'function' ? inv : null;
+}
+
 interface ServerConfig {
   avatar: {
     enabled: boolean;
@@ -151,33 +160,233 @@ export default function Settings() {
       {/* ── Subagent (translation + expression LLM) ────────────── */}
       <Section title="Avatar subagent">
         {cfg?.avatar?.subagent && (
-          <>
-            <ReadonlyRow label="enabled" value={String(cfg.avatar.subagent.enabled)} />
-            <ReadonlyRow
-              label="backend"
-              value={
-                cfg.avatar.subagent.use_zeroclaw_webhook
-                  ? 'zeroclaw-webhook  (slow ~5–10s/turn; reuses zeroclaw keys)'
-                  : `direct LLM  ${cfg.avatar.subagent.llm_base_url}  (fast ~1–3s)`
-              }
-              tone={cfg.avatar.subagent.use_zeroclaw_webhook ? 'warn' : 'good'}
-            />
-            <ReadonlyRow label="model" value={cfg.avatar.subagent.llm_model || '—'} />
-            <ReadonlyRow
-              label="API key"
-              value={cfg.avatar.subagent.llm_api_key_set ? '✓ set' : '✗ not set'}
-            />
-            <ReadonlyRow
-              label="only when translating"
-              value={cfg.avatar.subagent.only_when_translating ? 'yes (skip same-language)' : 'no (always run)'}
-            />
-            <ReadonlyRow label="timeout" value={`${cfg.avatar.subagent.timeout_secs}s`} />
-            {cfg.avatar.subagent.use_zeroclaw_webhook && !tomlHintDismissed && (
-              <SubagentSpeedupHint onDismiss={dismissTomlHint} />
-            )}
-          </>
+          <SubagentEditor
+            current={cfg.avatar.subagent}
+            tomlHintDismissed={tomlHintDismissed}
+            onDismissHint={dismissTomlHint}
+          />
         )}
       </Section>
+    </div>
+  );
+}
+
+// ── Editable subagent backend section ─────────────────────────────
+//
+// Routes "save" through `POST /api/config/subagent`. The companion-server
+// writes the choice to `companion.runtime.json` (sibling of the loaded
+// companion.toml). It takes effect on next process restart — the live
+// subagent is built once at startup, not hot-swappable. After save we
+// surface a "Restart Tauri" button (which triggers `app.restart()` via
+// a Tauri command) so the user doesn't have to manually close the
+// window.
+type Backend = 'direct' | 'webhook';
+
+function SubagentEditor({
+  current,
+  tomlHintDismissed,
+  onDismissHint,
+}: {
+  current: NonNullable<ServerConfig['avatar']>['subagent'];
+  tomlHintDismissed: boolean;
+  onDismissHint: () => void;
+}) {
+  const [backend, setBackend] = useState<Backend>(
+    current.use_zeroclaw_webhook ? 'webhook' : 'direct'
+  );
+  const [apiKey, setApiKey] = useState<string>('');
+  const [model, setModel] = useState<string>(current.llm_model || '');
+  const [baseUrl, setBaseUrl] = useState<string>(current.llm_base_url || '');
+  const [saving, setSaving] = useState(false);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const dirty =
+    backend !== (current.use_zeroclaw_webhook ? 'webhook' : 'direct') ||
+    apiKey.length > 0 ||
+    model.trim() !== (current.llm_model || '') ||
+    baseUrl.trim() !== (current.llm_base_url || '');
+
+  const handleSave = async () => {
+    setSaving(true);
+    setError(null);
+    const body: Record<string, unknown> = {
+      use_zeroclaw_webhook: backend === 'webhook',
+    };
+    // Only send fields that the user actually changed so we don't trample
+    // unrelated overrides server-side.
+    if (apiKey.length > 0) body.api_key = apiKey;
+    if (model.trim() !== (current.llm_model || '')) body.model = model.trim();
+    if (baseUrl.trim() !== (current.llm_base_url || '')) body.base_url = baseUrl.trim();
+    try {
+      const r = await fetch(`${HTTP_BASE}/api/config/subagent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(`save failed: ${r.status} ${await r.text()}`);
+      setSavedAt(Date.now());
+      // Clear the api-key input once it's saved — server stores it,
+      // /api/config redacts it on the next read; the form should not
+      // claim the key is still pending.
+      setApiKey('');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleRestart = async () => {
+    const inv = tauriInvoke();
+    if (!inv) {
+      // Browser path — we can only suggest manual reload of the server.
+      window.alert('Restart the companion-server process to apply.');
+      return;
+    }
+    try {
+      await inv('restart_app');
+    } catch (e) {
+      setError(`restart failed: ${(e as Error).message}`);
+    }
+  };
+
+  return (
+    <>
+      <ReadonlyRow label="enabled" value={String(current.enabled)} />
+      <ReadonlyRow
+        label="only when translating"
+        value={
+          current.only_when_translating
+            ? 'yes (skip same-language)'
+            : 'no (always run)'
+        }
+      />
+
+      {/* Backend selector */}
+      <div
+        style={{
+          display: 'flex',
+          gap: 12,
+          padding: '10px 0',
+          borderBottom: '1px solid #1f2227',
+          fontSize: 13,
+          alignItems: 'center',
+          flexWrap: 'wrap',
+        }}
+      >
+        <span style={{ minWidth: 160, color: '#888' }}>backend</span>
+        <label style={{ display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }}>
+          <input
+            type="radio"
+            name="backend"
+            checked={backend === 'direct'}
+            onChange={() => setBackend('direct')}
+          />
+          <span style={{ color: backend === 'direct' ? '#10b981' : '#cbd5e1' }}>
+            direct LLM <span style={{ color: '#666' }}>(fast ~1–3s)</span>
+          </span>
+        </label>
+        <label style={{ display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }}>
+          <input
+            type="radio"
+            name="backend"
+            checked={backend === 'webhook'}
+            onChange={() => setBackend('webhook')}
+          />
+          <span style={{ color: backend === 'webhook' ? '#f59e0b' : '#cbd5e1' }}>
+            zeroclaw webhook{' '}
+            <span style={{ color: '#666' }}>(slow ~5–10s, reuses zeroclaw key)</span>
+          </span>
+        </label>
+      </div>
+
+      {/* Direct-LLM connection fields (only meaningful when backend=direct) */}
+      {backend === 'direct' && (
+        <div
+          style={{
+            padding: '10px 0 4px',
+            borderBottom: '1px solid #1f2227',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 8,
+          }}
+        >
+          <FieldRow label="base URL">
+            <input
+              type="text"
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              placeholder="https://api.z.ai/api/coding/paas/v4"
+              style={inputStyle}
+            />
+          </FieldRow>
+          <FieldRow label="model">
+            <input
+              type="text"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              placeholder="glm-4.5-flash"
+              style={inputStyle}
+            />
+          </FieldRow>
+          <FieldRow label="API key">
+            <input
+              type="password"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder={
+                current.llm_api_key_set
+                  ? '••• already set (paste to replace)'
+                  : 'paste your z.ai / OpenAI / etc. key'
+              }
+              style={inputStyle}
+              autoComplete="off"
+            />
+          </FieldRow>
+          <div style={{ fontSize: 11, color: '#666', marginLeft: 168 }}>
+            Stored in <code style={{ color: '#888' }}>companion.runtime.json</code>{' '}
+            next to <code style={{ color: '#888' }}>companion.toml</code>. Don't commit
+            that file to git.
+          </div>
+        </div>
+      )}
+
+      {/* Save / restart buttons */}
+      <Row>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {error && <Hint tone="warn">{error}</Hint>}
+          {savedAt && !error && (
+            <Hint tone="good">
+              Saved. Click <strong>Restart</strong> to apply.
+            </Hint>
+          )}
+          {!savedAt && !error && dirty && (
+            <Hint tone="muted">unsaved changes</Hint>
+          )}
+        </div>
+        <Button onClick={handleSave} primary disabled={!dirty || saving}>
+          {saving ? 'saving…' : 'Save'}
+        </Button>
+        <Button onClick={handleRestart} disabled={!savedAt}>
+          Restart
+        </Button>
+      </Row>
+
+      <ReadonlyRow label="timeout" value={`${current.timeout_secs}s`} />
+
+      {backend === 'webhook' && !tomlHintDismissed && (
+        <SubagentSpeedupHint onDismiss={onDismissHint} />
+      )}
+    </>
+  );
+}
+
+function FieldRow({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+      <span style={{ minWidth: 160, color: '#888', fontSize: 12 }}>{label}</span>
+      <div style={{ flex: '1 1 280px', minWidth: 220 }}>{children}</div>
     </div>
   );
 }

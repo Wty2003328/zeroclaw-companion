@@ -73,13 +73,18 @@ async fn main() -> Result<()> {
         avatar: avatar_state,
         pulse: pulse_state,
         zeroclaw: Arc::new(zc),
+        config_path: config_path.clone(),
     };
 
     let mut router = Router::new()
         .route("/health", get(handle_health))
         .route("/api/status", get(handle_status))
         .route("/api/chat", axum::routing::post(handle_chat))
-        .route("/api/config", get(handle_get_config));
+        .route("/api/config", get(handle_get_config))
+        .route(
+            "/api/config/subagent",
+            axum::routing::post(handle_post_subagent_override),
+        );
 
     if app_state.avatar.is_some() {
         let avatar_state = Arc::clone(app_state.avatar.as_ref().unwrap());
@@ -415,6 +420,87 @@ async fn handle_get_config(
         "avatar": avatar,
         "zeroclaw_url": state.zeroclaw.health().await.ok().map(|_| "ok"),
     }))
+}
+
+#[derive(serde::Deserialize)]
+struct SubagentOverrideRequest {
+    /// `true` → route through zeroclaw's webhook (slow, no key needed).
+    /// `false` → direct LLM call (fast, needs api_key).
+    use_zeroclaw_webhook: Option<bool>,
+    /// Direct-LLM API key. If empty string, treated as "clear the override".
+    api_key: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+    timeout_secs: Option<u64>,
+}
+
+/// Persist the user's subagent settings choice to
+/// `companion.runtime.json` (sibling of companion.toml). The change
+/// takes effect on the next process restart — this handler never tries
+/// to hot-swap the live subagent because the wire path through
+/// `AvatarWsState` holds an `Option<Arc<AvatarSubagent>>` directly,
+/// not a lock. UI shows a "restart required" hint after success.
+async fn handle_post_subagent_override(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::Json(req): axum::Json<SubagentOverrideRequest>,
+) -> axum::response::Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    use companion_core::{RuntimeOverride, runtime_override_path};
+
+    let path = runtime_override_path(&state.config_path);
+
+    // Load the existing override (if any) so we don't trample unrelated keys.
+    let mut over = if path.exists() {
+        match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|b| serde_json::from_str::<RuntimeOverride>(&b).ok())
+        {
+            Some(v) => v,
+            None => RuntimeOverride::default(),
+        }
+    } else {
+        RuntimeOverride::default()
+    };
+
+    let mut sub = over.subagent.unwrap_or_default();
+
+    if let Some(v) = req.use_zeroclaw_webhook {
+        sub.use_zeroclaw_webhook = Some(v);
+    }
+    if let Some(v) = req.api_key {
+        // Empty string → treat as "clear the override".
+        sub.api_key = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.model {
+        sub.model = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.base_url {
+        sub.base_url = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.timeout_secs {
+        sub.timeout_secs = Some(v);
+    }
+
+    over.subagent = Some(sub);
+
+    let body = serde_json::to_string_pretty(&over).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize override: {e}"),
+        )
+    })?;
+    std::fs::write(&path, body).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write {}: {e}", path.display()),
+        )
+    })?;
+
+    tracing::info!(
+        "companion: wrote subagent override to {} (restart required to apply)",
+        path.display()
+    );
+    // 202 Accepted — saved, but takes effect after restart.
+    Ok(axum::http::StatusCode::ACCEPTED)
 }
 
 #[derive(serde::Deserialize)]
