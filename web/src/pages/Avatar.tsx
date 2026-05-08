@@ -81,29 +81,36 @@ function saveHistory(history: ChatTurn[]) {
   }
 }
 
-// Shared AudioContext. Reusing one context across turns avoids the
-// WebView2 quirk where each `new Audio(blob)` element gets routed
-// through a fresh decoder; this gave noticeably worse playback in
-// Tauri vs the browser. Web Audio decodes once, plays via
-// AudioBufferSourceNode at the file's native rate — bit-exact
-// regardless of host.
-let sharedAudioCtx: AudioContext | null = null;
-function getAudioContext(): AudioContext {
-  if (sharedAudioCtx) return sharedAudioCtx;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const Ctor = (window as any).AudioContext || (window as any).webkitAudioContext;
-  // `latencyHint: "playback"` tells the OS this is media playback,
-  // not low-latency interactive audio. On Windows / WebView2 this
-  // bypasses the "communications" DSP chain (AGC, noise-suppression,
-  // echo-cancellation) that would otherwise color the output.
-  // `sampleRate: 48000` matches the rate Asuna v4 outputs, avoiding
-  // a mandatory resample step.
-  sharedAudioCtx = new Ctor({ latencyHint: 'playback', sampleRate: 48000 });
-  return sharedAudioCtx as AudioContext;
+// Audio playback. We use a single hidden <video> element as the
+// renderer because:
+// - Chromium gives <video> the strongest "media playback" treatment in
+//   its internal audio session classification.
+// - Per-app audio mixers (Razer Synapse / THX Spatial / Nahimic / NVIDIA
+//   Broadcast) tend to recognize <video>-driven streams as media even
+//   when the host process is a custom Tauri app they don't have a
+//   profile for. Web Audio API and `<audio>` elements are treated more
+//   ambiguously and often get communications-style DSP.
+// - We still get per-byte fidelity: the WAV is decoded by the same
+//   media stack as YouTube videos.
+let sharedVideo: HTMLVideoElement | null = null;
+function getRenderer(): HTMLVideoElement {
+  if (sharedVideo) return sharedVideo;
+  const v = document.createElement('video');
+  v.muted = false;
+  v.controls = false;
+  v.playsInline = true;
+  v.style.position = 'fixed';
+  v.style.left = '-9999px';
+  v.style.width = '1px';
+  v.style.height = '1px';
+  v.style.opacity = '0';
+  v.style.pointerEvents = 'none';
+  document.body.appendChild(v);
+  sharedVideo = v;
+  return v;
 }
 
 interface PlaybackHandle {
-  source: AudioBufferSourceNode;
   duration: number;
   stop: () => void;
 }
@@ -112,23 +119,41 @@ async function decodeAndPlay(
   bytes: ArrayBuffer,
   onEnded: () => void,
 ): Promise<PlaybackHandle> {
-  const ctx = getAudioContext();
-  if (ctx.state === 'suspended') {
-    await ctx.resume();
+  const renderer = getRenderer();
+  // Stop any in-flight playback and free the previous URL.
+  try { renderer.pause(); } catch { /* ignore */ }
+  if (renderer.src) {
+    try { URL.revokeObjectURL(renderer.src); } catch { /* ignore */ }
+    renderer.removeAttribute('src');
+    renderer.load();
   }
-  // decodeAudioData mutates the input on some browsers; copy first.
-  const buf = await ctx.decodeAudioData(bytes.slice(0));
-  const source = ctx.createBufferSource();
-  source.buffer = buf;
-  source.connect(ctx.destination);
-  source.onended = onEnded;
-  source.start();
+
+  const blob = new Blob([bytes], { type: 'audio/wav' });
+  const url = URL.createObjectURL(blob);
+  renderer.src = url;
+
+  const cleanup = () => {
+    renderer.removeEventListener('ended', endedHandler);
+    renderer.removeEventListener('error', errorHandler);
+    try { URL.revokeObjectURL(url); } catch { /* ignore */ }
+  };
+  const endedHandler = () => {
+    cleanup();
+    onEnded();
+  };
+  const errorHandler = () => {
+    cleanup();
+    onEnded();
+  };
+  renderer.addEventListener('ended', endedHandler);
+  renderer.addEventListener('error', errorHandler);
+
+  await renderer.play();
   return {
-    source,
-    duration: buf.duration,
+    duration: Number.isFinite(renderer.duration) ? renderer.duration : 0,
     stop: () => {
-      try { source.stop(); } catch { /* already stopped */ }
-      try { source.disconnect(); } catch { /* ignore */ }
+      try { renderer.pause(); } catch { /* ignore */ }
+      cleanup();
     },
   };
 }
@@ -291,19 +316,17 @@ export default function Avatar() {
     const text = chatInput.trim();
     if (!text || sending) return;
 
-    // Browser autoplay pre-warm: nudge the shared AudioContext during
-    // this user gesture so the eventual decodeAndPlay (10–20s later)
-    // doesn't get blocked by autoplay policy.
+    // Browser autoplay pre-warm: poke the shared <video> element
+    // during this user gesture so the eventual decodeAndPlay (10–20s
+    // later) doesn't get blocked by autoplay policy. play() on an
+    // empty <video> rejects gracefully; what matters is that we've
+    // touched the element under a gesture.
     if (!audioUnlockedRef.current) {
       try {
-        const ctx = getAudioContext();
-        if (ctx.state === 'suspended') {
-          // resume() returns a promise; ignore the result, the
-          // context state flip is what matters
-          void ctx.resume();
-        }
+        const v = getRenderer();
+        v.play().catch(() => { /* expected when no src; gesture still counts */ });
         audioUnlockedRef.current = true;
-      } catch { /* ignore — fall back to manual play button */ }
+      } catch { /* ignore */ }
     }
 
     appendTurn({ role: 'user', text, ts: Date.now() });

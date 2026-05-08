@@ -157,7 +157,15 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     let mut motion_to_send: Option<AvatarNotification> = None;
     let mut subagent_used = false;
 
-    let (expression, tts_text_opt) = if let Some(ref subagent) = state.subagent {
+    // Skip subagent when chat == tts language and the user opted into
+    // the fast-path: the "translation" would be a no-op and keyword
+    // detection picks a sensible expression. Saves ~5–10s per turn.
+    let need_translation = chat_lang != tts_lang;
+    let should_run_subagent = state.subagent.is_some()
+        && (need_translation || !state.config.subagent.only_when_translating);
+
+    let (expression, tts_text_opt) = if should_run_subagent {
+        let subagent = state.subagent.as_ref().unwrap();
         match subagent.analyze(text, &chat_lang, &tts_lang).await {
             Some(analysis) => {
                 subagent_used = true;
@@ -174,6 +182,11 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
             None => (keyword_expr, None),
         }
     } else {
+        if state.subagent.is_some() && !need_translation {
+            tracing::debug!(
+                "avatar: subagent skipped (same language; only_when_translating=true)"
+            );
+        }
         (keyword_expr, None)
     };
 

@@ -48,6 +48,12 @@ auto_start = false
 # ─── Avatar subagent (expression analysis + cross-language translation) ─
 [avatar.subagent]
 enabled = false   # turn on once you've picked a backend below
+# Only run the subagent when chat_language ≠ tts.language (i.e. when
+# translation is actually needed). When true (default), same-language
+# setups use fast keyword expression detection and save ~5-10s per turn.
+# Set false if you want richer LLM-driven expressions even without
+# translation.
+only_when_translating = true
 # When true, route subagent calls through upstream zeroclaw's /webhook
 # (reuses zeroclaw's already-decrypted provider key — no plaintext key
 # needed in this file). Adds one round trip per agent reply. Recommended

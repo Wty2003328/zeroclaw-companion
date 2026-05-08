@@ -256,6 +256,14 @@ impl Default for LipSyncConfig {
 pub struct AvatarSubagentConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// When `true` (default), only run the subagent when chat_language
+    /// differs from tts.language — i.e. when we actually need
+    /// translation. For same-language setups this skips a 5-10s LLM
+    /// call and falls back to fast keyword-based expression detection.
+    /// Set to `false` if you want the LLM to always pick richer
+    /// expressions even when no translation is needed.
+    #[serde(default = "default_true")]
+    pub only_when_translating: bool,
     /// When `true`, route subagent calls through the configured zeroclaw
     /// daemon (via `[zeroclaw] url`) instead of a direct LLM endpoint.
     /// Reuses zeroclaw's keys; no plaintext key needed below.
@@ -283,6 +291,7 @@ impl Default for AvatarSubagentConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            only_when_translating: true,
             use_zeroclaw_webhook: false,
             llm: LlmConfig::default(),
             system_prompt: None,
