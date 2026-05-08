@@ -1,11 +1,19 @@
 [workspace]
 resolver = "2"
+# companion-tauri is intentionally NOT a workspace member: its build.rs
+# requires the companion-server sidecar binary to exist at
+# `apps/companion-tauri/binaries/companion-server-<triple>(.exe)` *before*
+# the build can proceed. Including it in `members` would break
+# `cargo check --workspace` from a clean tree. Users build the sidecar
+# first, then run `cd apps/companion-tauri && cargo tauri build`. See
+# `apps/companion-tauri/README.md`.
 members = [
     "crates/companion-core",
     "crates/companion-avatar",
     "crates/companion-pulse",
     "apps/companion-server",
 ]
+exclude = ["apps/companion-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,7 +21,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["zeroclaw-companion contributors"]
 repository = "https://github.com/Wty2003328/zeroclaw-companion"
-rust-version = "1.87"
+rust-version = "1.88"
 
 [workspace.dependencies]
 # Internal crates
