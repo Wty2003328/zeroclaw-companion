@@ -75,10 +75,15 @@ impl ZeroclawClient {
 
     /// Send a user message to the agent and return the textual reply.
     ///
-    /// Uses zeroclaw's `POST /api/chat` endpoint. For streaming, callers
-    /// should use [`Self::events`] alongside.
+    /// Uses zeroclaw's `POST /webhook` endpoint (verified against v0.7.5):
+    ///   request:  `{"message": "..."}`
+    ///   response: `{"model": "...", "response": "..."}`
+    ///
+    /// We tried `/api/chat` originally — it doesn't exist on v0.7.5.
+    /// `response` is the canonical key; we also accept `reply` / `text`
+    /// / `content` / `output` to be liberal across older or compat shapes.
     pub async fn send_chat(&self, message: &str) -> anyhow::Result<String> {
-        let url = format!("{}/api/chat", self.base_url);
+        let url = format!("{}/webhook", self.base_url);
         let body = serde_json::json!({ "message": message });
         let mut req = self.http.post(&url).json(&body);
         if let Some(ref tok) = self.pair_token {
@@ -88,20 +93,15 @@ impl ZeroclawClient {
         let status = resp.status();
         if !status.is_success() {
             let txt = resp.text().await.unwrap_or_default();
-            anyhow::bail!("zeroclaw /api/chat returned {status}: {txt}");
+            anyhow::bail!("zeroclaw /webhook returned {status}: {txt}");
         }
-        // Zeroclaw's reply shape is `{ "reply": "..." }` or similar.
-        // Be liberal in what we accept.
         let payload: serde_json::Value = resp.json().await?;
-        if let Some(reply) = payload.get("reply").and_then(|v| v.as_str()) {
-            return Ok(reply.to_string());
+        for key in &["response", "reply", "text", "content", "output"] {
+            if let Some(s) = payload.get(*key).and_then(|v| v.as_str()) {
+                return Ok(s.to_string());
+            }
         }
-        if let Some(text) = payload.get("text").and_then(|v| v.as_str()) {
-            return Ok(text.to_string());
-        }
-        if let Some(content) = payload.get("content").and_then(|v| v.as_str()) {
-            return Ok(content.to_string());
-        }
+        // Last-resort: stringify the whole payload.
         Ok(payload.to_string())
     }
 
@@ -139,14 +139,21 @@ impl ZeroclawClient {
     }
 }
 
-/// Best-effort classifier for upstream SSE payloads. Zeroclaw's exact
-/// event taxonomy isn't fully stable across releases — we look for the
-/// shapes the companion needs, fall back to `Other`.
+/// Best-effort classifier for upstream SSE payloads.
+///
+/// Zeroclaw v0.7.5's `/api/events` stream emits **observability** events
+/// only (`agent_start`, `agent_end`, `llm_request`, `tool_call`, …) —
+/// the agent's reply text comes back synchronously from `POST /webhook`,
+/// NOT as an SSE event. So classifying SSE as `AgentReply` is essentially
+/// best-effort speculation; the avatar pipeline drives off the synchronous
+/// chat response, not this classifier.
+///
+/// We still keep the classifier permissive enough to recognize hypothetical
+/// future event shapes (`event:"agent.reply"`, `role:"assistant"+final:true`)
+/// in case a downstream zeroclaw fork or future version starts broadcasting
+/// reply text. Today, every zeroclaw v0.7.x event lands as `Other`, which
+/// the SSE bridge logs at debug level.
 fn classify_event(raw: serde_json::Value) -> AgentEvent {
-    // Common shapes we've observed:
-    //   {"event":"agent.reply", "text":"...", "session_id":"..."}
-    //   {"type":"reply", "content":"..."}
-    //   {"role":"assistant", "content":"...", "final":true}
     let event_type = raw
         .get("event")
         .or_else(|| raw.get("type"))

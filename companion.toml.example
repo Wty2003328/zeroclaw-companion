@@ -43,13 +43,19 @@ auto_start = false
 
 # ─── Avatar subagent (expression analysis + cross-language translation) ─
 [avatar.subagent]
-enabled = false   # turn on once you have an LLM endpoint configured below
-timeout_secs = 3
+enabled = false   # turn on once you've picked a backend below
+# When true, route subagent calls through upstream zeroclaw's /webhook
+# (reuses zeroclaw's already-decrypted provider key — no plaintext key
+# needed in this file). Adds one round trip per agent reply. Recommended
+# when companion + zeroclaw share a host.
+use_zeroclaw_webhook = false
+timeout_secs = 3   # bump to 60+ when use_zeroclaw_webhook = true (zeroclaw's loop is slower)
 # system_prompt = "..."   # optional override; supports {chat_lang}/{tts_lang}
 
+# Direct OpenAI-compatible LLM endpoint. Ignored when use_zeroclaw_webhook=true.
 [avatar.subagent.llm]
-# OpenAI-compatible endpoint — works with OpenAI, OpenRouter, Together,
-# Groq, DeepInfra, vLLM, Ollama (`http://127.0.0.1:11434/v1`), LM Studio, …
+# Works with OpenAI, OpenRouter, Together, Groq, DeepInfra, vLLM,
+# Ollama (`http://127.0.0.1:11434/v1`), LM Studio, …
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
 # api_key = "sk-..."                # or rely on OPENAI_API_KEY env var

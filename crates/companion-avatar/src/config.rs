@@ -244,12 +244,26 @@ impl Default for LipSyncConfig {
 
 /// Avatar subagent: a cheap LLM call that emits expression JSON and (when
 /// `chat_language ≠ tts.language`) a translated reply.
+///
+/// Two backends:
+/// - `llm` (default): direct OpenAI-compatible call. Fastest. Requires
+///   a plaintext API key in this config (or via env var).
+/// - `use_zeroclaw_webhook = true`: re-uses upstream zeroclaw as the LLM
+///   by POSTing to its `/webhook`. No plaintext key needed in companion —
+///   zeroclaw already has its keys decrypted. Slower (each agent reply
+///   triggers a second zeroclaw round trip), but very simple to set up.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AvatarSubagentConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// When `true`, route subagent calls through the configured zeroclaw
+    /// daemon (via `[zeroclaw] url`) instead of a direct LLM endpoint.
+    /// Reuses zeroclaw's keys; no plaintext key needed below.
+    #[serde(default)]
+    pub use_zeroclaw_webhook: bool,
     /// LLM endpoint + model. Use any OpenAI-compatible provider
-    /// (OpenAI, OpenRouter, Together, Groq, Ollama, vLLM, …).
+    /// (OpenAI, OpenRouter, Together, Groq, Ollama, vLLM, …). Ignored
+    /// when `use_zeroclaw_webhook = true`.
     #[serde(default)]
     pub llm: LlmConfig,
     /// Custom system prompt override (replaces the built-in default).
@@ -269,6 +283,7 @@ impl Default for AvatarSubagentConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            use_zeroclaw_webhook: false,
             llm: LlmConfig::default(),
             system_prompt: None,
             timeout_secs: default_subagent_timeout(),

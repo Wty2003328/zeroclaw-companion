@@ -20,6 +20,10 @@ companion.toml
 .env
 .env.*
 
+# E2E test artifacts (saved audio, captured frames)
+/e2e_audio.wav
+/e2e_*.wav
+
 # Editor / OS
 .idea/
 .vscode/

@@ -2,7 +2,7 @@
 //!
 //! Mock zeroclaw is an axum server that:
 //! - Returns 200 on `/health`
-//! - Echoes a reply on `POST /api/chat`
+//! - Echoes a reply on `POST /webhook` (matches real zeroclaw v0.7.5)
 //! - Streams `text/event-stream` on `GET /api/events`
 
 use std::time::Duration;
@@ -21,13 +21,14 @@ async fn boot_mock(events: Vec<&'static str>) -> u16 {
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route(
-            "/api/chat",
+            "/webhook",
             post(|Json(p): Json<serde_json::Value>| async move {
                 let msg = p
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("(no message)");
-                Json(json!({"reply": format!("echo: {msg}")}))
+                // Real zeroclaw v0.7.5 returns {"model":"...","response":"..."}
+                Json(json!({"model": "test-model", "response": format!("echo: {msg}")}))
             }),
         )
         .route(

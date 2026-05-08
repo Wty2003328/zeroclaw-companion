@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
     }
 
     // ── 2. Build the avatar subsystem (if enabled) ───────────────
-    let avatar_state = build_avatar(&cfg).await?;
+    let avatar_state = build_avatar(&cfg, zc.clone()).await?;
 
     // ── 3. SSE bridge: zeroclaw /api/events → avatar broadcast ────
     if let Some(ref state) = avatar_state {
@@ -77,7 +77,8 @@ async fn main() -> Result<()> {
 
     let mut router = Router::new()
         .route("/health", get(handle_health))
-        .route("/api/status", get(handle_status));
+        .route("/api/status", get(handle_status))
+        .route("/api/chat", axum::routing::post(handle_chat));
 
     if app_state.avatar.is_some() {
         let avatar_state = Arc::clone(app_state.avatar.as_ref().unwrap());
@@ -175,7 +176,10 @@ fn resolve_web_dist(configured: &Option<String>) -> PathBuf {
         .join("dist")
 }
 
-async fn build_avatar(cfg: &CompanionConfig) -> Result<Option<Arc<AvatarWsState>>> {
+async fn build_avatar(
+    cfg: &CompanionConfig,
+    zeroclaw_client: ZeroclawClient,
+) -> Result<Option<Arc<AvatarWsState>>> {
     // Avatar config lives under [avatar] in companion.toml. We deserialize
     // here (companion-core kept it as a Value to stay decoupled).
     let avatar_cfg: AvatarConfig = serde_json::from_value(cfg.avatar.clone())
@@ -185,13 +189,25 @@ async fn build_avatar(cfg: &CompanionConfig) -> Result<Option<Arc<AvatarWsState>
         return Ok(None);
     }
 
-    // Optional subagent (expression analysis + translation).
+    // Optional subagent (expression analysis + translation). When
+    // `use_zeroclaw_webhook = true` we pass the upstream client so the
+    // backend can route through zeroclaw and reuse its (already-decrypted)
+    // provider key.
     let subagent = if avatar_cfg.subagent.enabled {
-        match AvatarSubagent::new(&avatar_cfg.subagent) {
+        let zc_for_subagent = if avatar_cfg.subagent.use_zeroclaw_webhook {
+            Some(zeroclaw_client.clone())
+        } else {
+            None
+        };
+        match AvatarSubagent::new(&avatar_cfg.subagent, zc_for_subagent) {
             Ok(s) => {
                 tracing::info!(
-                    "companion: avatar subagent ready (model={})",
-                    avatar_cfg.subagent.llm.model
+                    "companion: avatar subagent ready (backend={})",
+                    if avatar_cfg.subagent.use_zeroclaw_webhook {
+                        "zeroclaw-webhook"
+                    } else {
+                        "openai-compatible"
+                    }
                 );
                 Some(Arc::new(s))
             }
@@ -290,4 +306,54 @@ async fn handle_status(
         "avatar_enabled": state.avatar.is_some(),
         "pulse_enabled": state.pulse.is_some(),
     }))
+}
+
+#[derive(serde::Deserialize)]
+struct ChatRequest {
+    message: String,
+}
+
+#[derive(serde::Serialize)]
+struct ChatResponse {
+    reply: String,
+}
+
+/// Forward a user message to upstream zeroclaw, return the reply, AND
+/// fan it out to any connected avatar viewer so the avatar speaks.
+///
+/// We learned the hard way during e2e that zeroclaw v0.7.5's reply text
+/// only comes back from `POST /webhook` synchronously — it is NOT
+/// broadcast on `/api/events` SSE. So this handler is the load-bearing
+/// path for driving the avatar pipeline; the SSE bridge is only useful
+/// for observability events (tool calls, agent_start/end timing, …).
+async fn handle_chat(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::Json(req): axum::Json<ChatRequest>,
+) -> Result<axum::Json<ChatResponse>, (axum::http::StatusCode, String)> {
+    if req.message.trim().is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "message must not be empty".into(),
+        ));
+    }
+    tracing::info!("companion: /api/chat → zeroclaw ({}c)", req.message.len());
+    let reply = state
+        .zeroclaw
+        .send_chat(&req.message)
+        .await
+        .map_err(|e| {
+            tracing::error!("companion: zeroclaw chat failed: {e}");
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                format!("zeroclaw error: {e}"),
+            )
+        })?;
+
+    // Fan out to the avatar so it speaks the reply.
+    if let Some(ref avatar) = state.avatar {
+        let _ = avatar.event_tx.send(companion_avatar::AvatarEvent::Speak {
+            text: reply.clone(),
+        });
+    }
+    Ok(axum::Json(ChatResponse { reply }))
 }

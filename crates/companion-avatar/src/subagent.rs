@@ -6,14 +6,66 @@
 //! keyword-based expression detection + the original (un-translated)
 //! text — the avatar still animates and speaks something.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AvatarSubagentConfig;
 use crate::expression::Live2DExpression;
 use companion_core::llm::{ChatMessage, LlmClient, Role};
+use companion_core::zeroclaw::ZeroclawClient;
+
+/// LLM backend the subagent calls. Two impls ship:
+/// - [`LlmClient`] (companion-core): direct OpenAI-compatible.
+/// - [`ZeroclawWebhookBackend`]: round-trips through upstream zeroclaw,
+///   reusing whatever provider/key zeroclaw is configured with.
+#[async_trait]
+pub trait SubagentBackend: Send + Sync {
+    async fn ask(&self, system_prompt: &str, user_msg: &str) -> Result<String>;
+}
+
+#[async_trait]
+impl SubagentBackend for LlmClient {
+    async fn ask(&self, system_prompt: &str, user_msg: &str) -> Result<String> {
+        let messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: system_prompt.to_string(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: user_msg.to_string(),
+            },
+        ];
+        self.chat(&messages).await
+    }
+}
+
+/// Subagent backend that calls upstream zeroclaw via `POST /webhook`.
+/// We pack the system prompt into the user message because zeroclaw's
+/// webhook is a single-shot agent-loop trigger — no role separation.
+pub struct ZeroclawWebhookBackend {
+    client: ZeroclawClient,
+}
+
+impl ZeroclawWebhookBackend {
+    pub fn new(client: ZeroclawClient) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl SubagentBackend for ZeroclawWebhookBackend {
+    async fn ask(&self, system_prompt: &str, user_msg: &str) -> Result<String> {
+        let combined = format!(
+            "{system_prompt}\n\n--- begin reply to analyze ---\n{user_msg}\n--- end reply ---",
+        );
+        self.client.send_chat(&combined).await
+    }
+}
 
 /// System prompt template. `{chat_lang}` and `{tts_lang}` are substituted
 /// at call time so the subagent knows whether to translate.
@@ -66,25 +118,57 @@ pub struct SubagentMotion {
     pub index: u32,
 }
 
-/// The avatar subagent. Wraps an OpenAI-compatible LLM client.
+/// The avatar subagent. Holds whichever backend the config selected.
 pub struct AvatarSubagent {
-    client: LlmClient,
+    backend: Arc<dyn SubagentBackend>,
     timeout: Duration,
     system_prompt_template: String,
 }
 
 impl AvatarSubagent {
-    pub fn new(config: &AvatarSubagentConfig) -> Result<Self> {
-        let client = LlmClient::new(&config.llm)?;
+    /// Build with the default backend chosen from config:
+    /// - `use_zeroclaw_webhook=true` → [`ZeroclawWebhookBackend`] (needs
+    ///   `zeroclaw_client`).
+    /// - else → direct [`LlmClient`].
+    pub fn new(
+        config: &AvatarSubagentConfig,
+        zeroclaw_client: Option<ZeroclawClient>,
+    ) -> Result<Self> {
+        let backend: Arc<dyn SubagentBackend> = if config.use_zeroclaw_webhook {
+            let client = zeroclaw_client
+                .ok_or_else(|| anyhow::anyhow!(
+                    "subagent.use_zeroclaw_webhook = true but no ZeroclawClient was supplied"
+                ))?;
+            Arc::new(ZeroclawWebhookBackend::new(client))
+        } else {
+            Arc::new(LlmClient::new(&config.llm)?)
+        };
         let system_prompt_template = config
             .system_prompt
             .clone()
             .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
         Ok(Self {
-            client,
+            backend,
             timeout: Duration::from_secs(config.timeout_secs),
             system_prompt_template,
         })
+    }
+
+    /// Build with an explicit backend. Useful for tests and for callers
+    /// that already have a backend instance they want to inject.
+    pub fn with_backend(
+        backend: Arc<dyn SubagentBackend>,
+        config: &AvatarSubagentConfig,
+    ) -> Self {
+        let system_prompt_template = config
+            .system_prompt
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+        Self {
+            backend,
+            timeout: Duration::from_secs(config.timeout_secs),
+            system_prompt_template,
+        }
     }
 
     /// Analyze a main agent reply. Returns `None` on timeout/parse failure.
@@ -101,18 +185,8 @@ impl AvatarSubagent {
             .replace("{chat_lang}", chat_language)
             .replace("{tts_lang}", tts_language);
 
-        let messages = vec![
-            ChatMessage {
-                role: Role::System,
-                content: system_prompt,
-            },
-            ChatMessage {
-                role: Role::User,
-                content: truncated.to_string(),
-            },
-        ];
-
-        let result = tokio::time::timeout(self.timeout, self.client.chat(&messages)).await;
+        let result =
+            tokio::time::timeout(self.timeout, self.backend.ask(&system_prompt, truncated)).await;
 
         match result {
             Ok(Ok(response_text)) => {
