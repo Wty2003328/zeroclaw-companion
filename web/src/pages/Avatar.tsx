@@ -260,7 +260,14 @@ export default function Avatar() {
   }, [history]);
 
   const appendTurn = useCallback((turn: ChatTurn) => {
-    setHistory((prev) => [...prev, turn].slice(-HISTORY_LIMIT));
+    setHistory((prev) => {
+      const next = [...prev, turn].slice(-HISTORY_LIMIT);
+      console.log(
+        `[chat] +${turn.role} "${turn.text.slice(0, 40)}" → ${next.length} turns (`
+        + `${next.filter(t => t.role === 'user').length}u/${next.filter(t => t.role === 'assistant').length}a)`
+      );
+      return next;
+    });
   }, []);
 
   const clearHistory = useCallback(() => {
