@@ -68,13 +68,16 @@ async fn handle_avatar_socket(mut socket: WebSocket, state: Arc<AvatarWsState>) 
         return;
     }
 
+    // Default model URL lives under `/live2d/`, NOT `/avatar/`, to avoid
+    // colliding with the React Router route `/avatar`. The frontend
+    // serves these files from web/public/live2d/.
     let model_info = AvatarNotification::ModelInfo {
         model_url: state
             .config
             .model
             .model_dir
             .clone()
-            .unwrap_or_else(|| "/avatar/models/haru/Haru.model3.json".to_string()),
+            .unwrap_or_else(|| "/live2d/models/haru/Haru.model3.json".to_string()),
         scale: state.config.model.scale,
         anchor: state.config.model.anchor.clone(),
         default_expression: state.config.model.default_expression.clone(),

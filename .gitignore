@@ -11,8 +11,11 @@ Cargo.lock.bak
 **/tsconfig.tsbuildinfo
 *.log
 
-# Live2D model assets (large binaries — users provide their own)
-/web/public/avatar/models/
+# Live2D model assets (large binaries; users supply their own).
+# The Live2D Cubism SDK sample models (Haru, Hiyori, Mark, etc.) ship
+# from Live2D under a free-for-individuals license and shouldn't be
+# redistributed via this repo. Bring them under web/public/live2d/.
+/web/public/live2d/
 /web/public/live2dcubismcore.min.js
 
 # Local config

@@ -60,6 +60,12 @@ $EDITOR companion.toml
 # build the web bundle
 cd web && npm install && npm run build && cd ..
 
+# Drop a Live2D model under web/public/live2d/models/<name>/.
+# The Cubism SDK sample models (Haru, Hiyori, Mark, …) work out of the box;
+# download from https://www.live2d.com/en/learn/sample/. The default expected
+# path is web/public/live2d/models/haru/Haru.model3.json — change with
+# [avatar.model] model_dir in companion.toml.
+
 # build + run the server
 cargo run --release -p companion-server
 # listens on http://127.0.0.1:9181
