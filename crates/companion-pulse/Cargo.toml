@@ -4,12 +4,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Pulse dashboard subsystem (collectors, scheduler, storage) for the zeroclaw companion. STUB — full migration tracked in docs/PULSE-MIGRATION.md."
+description = "Pulse dashboard subsystem (collectors, scheduler, storage) for the zeroclaw companion."
 
 [dependencies]
 companion-core.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+async-trait.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["v4"] }
+reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+feed-rs = "2.3"
+
+[dev-dependencies]
+tempfile = "3.26"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+toml.workspace = true

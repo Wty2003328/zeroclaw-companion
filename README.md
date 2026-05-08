@@ -14,7 +14,8 @@ public REST + SSE API instead — zero patches, no version coupling, much easier
   works (GPT-SoVITS, Fish-Speech, MeloTTS, XTTS, F5-TTS, edge-tts, …)
 - **Chat / TTS language decoupling**: chat with the agent in English, have the avatar
   speak Japanese. The avatar subagent translates each reply via a cheap LLM call.
-- **Pulse dashboard** (in progress — see `docs/PULSE-MIGRATION.md`)
+- **Pulse dashboard**: SQLite-backed feed of items from RSS/Atom feeds and Hacker News
+  with a per-collector "Run now" trigger. Extensible via the `Collector` trait.
 
 ## Architecture
 
@@ -112,9 +113,9 @@ cd web && npm run dev    # http://127.0.0.1:5173
 |----------------------|---------------------------------------------------------|
 | companion-core       | working (zeroclaw client, LLM, config)                  |
 | companion-avatar     | working (TTS port, subagent, expression, WS handler)    |
+| companion-pulse      | working (SQLite store, RSS + HN collectors, REST API)   |
 | Asuna v4 TTS wrapper | working (`tools/avatar/asuna_tts_server.py`)            |
-| companion-pulse      | stub — see `docs/PULSE-MIGRATION.md`                    |
-| Tauri desktop shell  | not yet ported from fork                                |
+| Tauri desktop shell  | working (`apps/companion-tauri/`, bundles companion-server when packaged) |
 
 ## License
 

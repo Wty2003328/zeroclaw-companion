@@ -30,7 +30,9 @@ use companion_avatar::{
     handle_ws_avatar,
 };
 use companion_core::{AgentEvent, CompanionConfig, ZeroclawClient};
+use companion_pulse::{PulseConfig, PulseSubsystem};
 
+mod pulse_api;
 mod state;
 use state::AppState;
 
@@ -63,9 +65,13 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── 4. Build the axum app ─────────────────────────────────────
+    // ── 4. Build the Pulse subsystem (if enabled) ────────────────
+    let pulse_state = build_pulse(&cfg).await?;
+
+    // ── 5. Build the axum app ─────────────────────────────────────
     let app_state = AppState {
         avatar: avatar_state,
+        pulse: pulse_state,
         zeroclaw: Arc::new(zc),
     };
 
@@ -79,6 +85,11 @@ async fn main() -> Result<()> {
             "/ws/avatar",
             get(handle_ws_avatar).with_state(avatar_state),
         );
+    }
+
+    if let Some(ref pulse) = app_state.pulse {
+        let pulse_routes = pulse_api::routes().with_state(Arc::clone(pulse));
+        router = router.nest("/api/pulse", pulse_routes);
     }
 
     // Serve the companion web bundle (Vite build output).
@@ -224,6 +235,18 @@ async fn build_avatar(cfg: &CompanionConfig) -> Result<Option<Arc<AvatarWsState>
     })))
 }
 
+async fn build_pulse(cfg: &CompanionConfig) -> Result<Option<Arc<PulseSubsystem>>> {
+    let pulse_cfg: PulseConfig = serde_json::from_value(cfg.pulse.clone()).unwrap_or_default();
+    if !pulse_cfg.enabled {
+        tracing::info!("companion: pulse disabled in config");
+        return Ok(None);
+    }
+    let subsystem = PulseSubsystem::start(&pulse_cfg)
+        .await
+        .context("companion: pulse init failed")?;
+    Ok(Some(Arc::new(subsystem)))
+}
+
 /// Subscribe to zeroclaw's SSE event stream and forward agent replies to
 /// the avatar broadcast channel. Reconnects on failure with exponential
 /// backoff capped at 30s.
@@ -265,5 +288,6 @@ async fn handle_status(
         "ok": true,
         "zeroclaw_up": zc_up,
         "avatar_enabled": state.avatar.is_some(),
+        "pulse_enabled": state.pulse.is_some(),
     }))
 }

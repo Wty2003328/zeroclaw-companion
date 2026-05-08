@@ -1,85 +1,77 @@
-# Pulse migration plan
+# Pulse — what's done, what's next
 
-`companion-pulse` is currently a stub. This document tracks what's left to
-port from the fork's `src/pulse/` and `web/src/components/pulse/` into the
-companion repo.
+The Pulse subsystem is now part of `zeroclaw-companion` proper. The
+fork's old `src/pulse/` does not need to exist anywhere else.
 
-## Source inventory (in the fork)
+## What's in `companion-pulse`
 
-```
-src/pulse/
-├── api_calendar.rs     ─┐
-├── api_feed.rs          │
-├── api_settings.rs      │  REST handlers — needs reimplementation
-├── api_system.rs        │  on companion-server's axum router
-├── collectors/
-│   ├── github.rs       ─┐
-│   ├── hackernews.rs    │
-│   ├── reddit.rs        │  All collectors run periodically and push
-│   ├── rss.rs           │  results into storage. Self-contained
-│   ├── stocks.rs        │  modulo HTTP client.
-│   ├── videos.rs        │
-│   └── weather.rs      ─┘
-├── config.rs            ──> moves into companion.toml [pulse] block
-├── config_loader.rs     ──> companion-core handles config loading
-├── models.rs            ──> domain types (Item, Source, Digest, …)
-├── scheduler.rs         ──> tokio task that ticks each collector on its cadence
-└── storage.rs           ──> SQLite-backed feed/digest storage
+- **Storage** (`storage.rs`) — SQLite-backed `PulseDatabase` with tables
+  for items, collector runs, and user-managed feeds. WAL mode, async
+  via `spawn_blocking`. 7 unit tests covering insert / dedup / pagination
+  / source filter / collector run lifecycle / purge.
+- **Models** (`models.rs`) — `RawItem`, `Item`, `FeedItem`, `CollectorRun`.
+- **Config** (`config.rs`) — `[pulse]` block in `companion.toml` with
+  per-collector knobs. 2 unit tests for parsing.
+- **Scheduler** (`scheduler.rs`) — one tokio task per enabled collector,
+  configurable cadence, run logs persisted, manual `trigger_collector` API.
+- **Collector trait** (`collectors/mod.rs`) — `id`/`name`/`default_interval`/
+  `enabled`/`collect`. `parse_interval("30m" / "1h" / "45s")` helper. 5
+  unit tests.
 
-web/src/components/pulse/   ~2,300 LOC of widgets, settings, dashboard
-web/src/types/pulse.ts
-web/src/hooks/useWidgetData.ts
-web/src/lib/pulseUtils.ts
-```
+## Collectors shipped
 
-## Migration plan
+- `rss` (`collectors/rss.rs`) — RSS / Atom via `feed-rs`. Tests parse
+  canned XML so we don't hit the network in CI.
+- `hackernews` (`collectors/hackernews.rs`) — top stories filtered by
+  score; `item_to_raw` is public so its conversion logic is unit-tested
+  without the API.
 
-### Step 1 — Domain + storage (smallest, do first)
-Port `models.rs` and `storage.rs` to `crates/companion-pulse/src/`. The
-storage layer is SQLite-backed and self-contained. No companion-server
-changes required yet.
+## Collectors not yet ported
 
-### Step 2 — Collectors
-Port collectors one at a time, starting with `rss.rs` (simplest, least
-external API surface). Each collector implements a small `Collector`
-trait and writes to storage. The scheduler is a single tokio task that
-loops over enabled collectors at their configured cadence.
+Each was in the fork; not migrated because it depends on a third-party
+API key or a more involved implementation:
 
-### Step 3 — REST API on companion-server
-Reimplement `api_feed.rs` / `api_calendar.rs` / `api_system.rs` /
-`api_settings.rs` as axum handlers in `apps/companion-server/src/api/`.
-Add a `PulseSubsystem` field to `AppState` and mount routes when
-`[pulse] enabled = true`.
+| Collector | Why deferred |
+|---|---|
+| `weather` | Needs an OpenWeatherMap-class API key; ~300 LOC |
+| `stocks`  | Needs an Alpha Vantage / Finnhub key; ~170 LOC |
+| `github`  | Auth + rate limits; ~210 LOC |
+| `reddit`  | Needs Reddit API auth; ~150 LOC |
+| `videos`  | Hot-reloads channels from DB and uses YouTube/Bilibili APIs; ~235 LOC |
 
-### Step 4 — Frontend port
-Copy `web/src/components/pulse/` into the companion's `web/src/`. The
-fork uses Tailwind + custom theme tokens; the companion currently uses
-inline styles. Two options:
+To port any of them: copy the file from the fork, rewrite imports
+(`crate::pulse::config::FooConfig` → `crate::config::FooConfig`,
+`crate::pulse::models::RawItem` → `crate::models::RawItem`),
+add the `FooConfig` to `companion-pulse/src/config.rs`'s `CollectorsConfig`
+struct, register in `PulseSubsystem::start`, write unit tests against the
+public `item_to_raw`-style entry point.
 
-- **(a)** keep the fork's Tailwind + `pulseUtils` and just paste the
-  components in. ~1 hour, but the companion picks up Tailwind as a
-  dep.
-- **(b)** rewrite the widget styling inline like Avatar.tsx. ~2–3 hours,
-  but no new build deps.
+## REST API
 
-### Step 5 — Wire into nav
-Replace `pages/Pulse.tsx` (currently a placeholder) with the real
-dashboard component.
+Mounted at `/api/pulse/*` only when `[pulse] enabled = true`:
 
-## Estimated effort
+| Method | Path | Purpose |
+|---|---|---|
+| GET    | `/api/pulse/feed?limit=&offset=&source=` | Recent items |
+| GET    | `/api/pulse/status`                      | Collectors + run history |
+| POST   | `/api/pulse/trigger/{id}`                | Manual collector run |
+| GET    | `/api/pulse/feeds`                       | User-managed RSS feed list |
+| POST   | `/api/pulse/feeds`                       | Add a feed |
+| DELETE | `/api/pulse/feeds?url=...`               | Remove a feed |
 
-- Steps 1–3: 4–6 hours of focused porting (reasonably mechanical)
-- Step 4: 1–3 hours depending on style choice
-- Step 5: 30 minutes
+## Frontend
 
-Total: one focused session.
+`web/src/pages/Pulse.tsx` renders:
+- Header with source filter dropdown + manual refresh button
+- Per-collector cards (interval, last-run status, "Run now" button)
+- Recent items list (title, source, timestamp, content excerpt, link)
 
-## Out of scope for this migration
+Polls `/api/pulse/feed` and `/api/pulse/status` every 30s.
 
-- Calendar sync (the fork's calendar widget uses Google Calendar; if we
-  want this in companion we should consume zeroclaw's existing Google
-  Workspace integration over its API rather than re-implementing OAuth).
-- Email digests (same reasoning; route through zeroclaw's email channel).
+## What's deliberately out of scope
 
-These are *features* that should layer on top of the basic Pulse
-dashboard once the rest is ported.
+The fork had AI-summarization + relevance-scoring layers (`models.rs::Score`,
+`Summary`, `Tag`). They're omitted here — if you want LLM-driven curation,
+the avatar subagent is already a good template; build a Pulse summarizer
+the same way (companion-pulse adds a method, calls `companion_core::LlmClient`).
+Saved for a follow-up because shipping the basic feed is more useful first.

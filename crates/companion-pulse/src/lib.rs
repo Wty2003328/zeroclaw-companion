@@ -1,44 +1,70 @@
-//! Pulse dashboard subsystem for the zeroclaw companion.
+//! Pulse — personal intelligence dashboard for the zeroclaw companion.
 //!
-//! **Status: stub.** Full migration of the fork's `src/pulse/` (collectors,
-//! scheduler, storage, models, API) is tracked in `docs/PULSE-MIGRATION.md`
-//! and lands in a follow-up session. This file exists so the workspace
-//! resolves and downstream consumers can wire the eventual subsystem in
-//! without churn.
+//! Periodic collectors (RSS, HackerNews, …) push items into a SQLite-backed
+//! store. The companion-server exposes the feed at `/api/pulse/*`. The
+//! frontend renders a dashboard.
+//!
+//! Architecture:
+//! ```text
+//!   PulseConfig (companion.toml [pulse])
+//!         │
+//!         ▼
+//!   Scheduler ── runs each Collector at its interval ──▶ PulseDatabase
+//!                                                              │
+//!                                                              ▼
+//!                                                       /api/pulse/feed
+//! ```
 
-use serde::{Deserialize, Serialize};
+pub mod collectors;
+pub mod config;
+pub mod models;
+pub mod scheduler;
+pub mod storage;
 
-/// Placeholder Pulse subsystem.
-#[derive(Debug, Default)]
+pub use config::{PulseConfig, RssConfig, FeedEntry, HackerNewsConfig};
+pub use models::{CollectorRun, FeedItem, RawItem};
+pub use scheduler::{Scheduler, trigger_collector};
+pub use storage::PulseDatabase;
+pub use collectors::{Collector, parse_interval};
+
+use std::sync::Arc;
+
+/// Shared Pulse subsystem state. Held by the server's AppState when
+/// `[pulse] enabled = true`.
+#[derive(Clone)]
 pub struct PulseSubsystem {
-    enabled: bool,
+    pub db: PulseDatabase,
+    pub collectors: Vec<Arc<dyn Collector>>,
 }
 
 impl PulseSubsystem {
-    pub fn new(enabled: bool) -> Self {
-        Self { enabled }
-    }
+    /// Build the subsystem and start the scheduler in the background.
+    pub async fn start(cfg: &PulseConfig) -> anyhow::Result<Self> {
+        // Resolve DB path. Default ./data/pulse.db relative to CWD.
+        let db_path = cfg.database.path.clone();
+        let db = PulseDatabase::new(&db_path).await?;
 
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
+        let mut list: Vec<Arc<dyn Collector>> = Vec::new();
+        if let Some(rss) = cfg.collectors.rss.clone() {
+            list.push(Arc::new(collectors::rss::RssCollector::new(rss)));
+        }
+        if let Some(hn) = cfg.collectors.hackernews.clone() {
+            list.push(Arc::new(collectors::hackernews::HackerNewsCollector::new(
+                hn,
+            )));
+        }
 
-/// Placeholder Pulse config; the real shape lands when collectors/storage
-/// are ported.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PulseConfig {
-    #[serde(default)]
-    pub enabled: bool,
-}
+        tracing::info!("pulse: {} collector(s) registered", list.len());
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+        let sched = Arc::new(Scheduler::new(list.clone(), db.clone()));
+        let sched_handle = Arc::clone(&sched);
+        tokio::spawn(async move {
+            sched_handle.start().await;
+        });
 
-    #[test]
-    fn pulse_disabled_by_default() {
-        let p = PulseSubsystem::default();
-        assert!(!p.is_enabled());
+        Ok(Self {
+            db,
+            collectors: list,
+        })
     }
 }

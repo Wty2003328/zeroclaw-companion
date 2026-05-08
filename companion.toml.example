@@ -65,9 +65,28 @@ default_expression = "neutral"
 scale = 0.2
 anchor = "center"
 
-# ─── Pulse dashboard (stub — full migration tracked in docs/PULSE-MIGRATION.md) ──
+# ─── Pulse dashboard ─────────────────────────────────────────────
 [pulse]
-enabled = false
+enabled = false   # set true to enable; serves /api/pulse/* and /pulse UI
+
+[pulse.database]
+path = "./data/pulse.db"
+retention_days = 30
+
+# At least one collector must be configured for Pulse to surface anything.
+
+[pulse.collectors.rss]
+enabled = true
+interval = "30m"
+feeds = [
+    { name = "Hacker News", url = "https://hnrss.org/frontpage" },
+    { name = "Lobsters",    url = "https://lobste.rs/rss" },
+]
+
+[pulse.collectors.hackernews]
+enabled = true
+interval = "15m"
+min_score = 50
 
 
 # ───────────────────────────────────────────────────────────────────
