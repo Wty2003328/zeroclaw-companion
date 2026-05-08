@@ -6,7 +6,11 @@
 [zeroclaw]
 url = "http://127.0.0.1:8080"   # where the upstream zeroclaw daemon listens
 # pair_token = "..."            # only if zeroclaw requires pairing
-timeout_secs = 60
+# Big enough for zeroclaw's full agent loop including tool use.
+# Queries like "news about X" can fan out to 8+ web_searches and
+# easily exceed 60s. 300s default; raise further if you have tools
+# that take longer (deep crawls, long shell commands, …).
+timeout_secs = 300
 
 # ─── Companion's own bind ────────────────────────────────────────
 [server]

@@ -62,7 +62,15 @@ pub struct ZeroclawConfig {
     /// Optional pairing token for authenticated zeroclaw deployments.
     #[serde(default)]
     pub pair_token: Option<String>,
-    /// HTTP timeout in seconds for non-streaming requests.
+    /// HTTP timeout in seconds for `POST /webhook` chat calls.
+    ///
+    /// Default 300s — enough headroom for zeroclaw's full agent loop
+    /// including tool-use rounds. Common queries that need this:
+    /// - "tell me news about X" (multi-step web_search)
+    /// - "browse this URL" (browser tool)
+    /// - any cron schedule / shell command path
+    /// Smaller values will return 502 from companion's /api/chat when
+    /// the agent runs longer than the budget.
     #[serde(default = "default_zeroclaw_timeout")]
     pub timeout_secs: u64,
 }
@@ -72,7 +80,7 @@ fn default_zeroclaw_url() -> String {
 }
 
 fn default_zeroclaw_timeout() -> u64 {
-    60
+    300
 }
 
 impl Default for ZeroclawConfig {

@@ -402,17 +402,46 @@ async fn handle_chat(
         ));
     }
     tracing::info!("companion: /api/chat → zeroclaw ({}c)", req.message.len());
+    let started = std::time::Instant::now();
     let reply = state
         .zeroclaw
         .send_chat(&req.message)
         .await
         .map_err(|e| {
-            tracing::error!("companion: zeroclaw chat failed: {e}");
-            (
-                axum::http::StatusCode::BAD_GATEWAY,
-                format!("zeroclaw error: {e}"),
-            )
+            let elapsed = started.elapsed().as_secs();
+            // Distinguish timeout from generic errors so the UI can
+            // render a useful message instead of "502 Bad Gateway".
+            // reqwest's timeout error includes "operation timed out" /
+            // "deadline has elapsed" depending on platform; check both.
+            let msg = e.to_string();
+            let is_timeout = msg.contains("timed out") || msg.contains("deadline");
+            tracing::error!(
+                "companion: zeroclaw chat failed after {}s ({}): {e}",
+                elapsed,
+                if is_timeout { "TIMEOUT" } else { "ERROR" }
+            );
+            if is_timeout {
+                (
+                    axum::http::StatusCode::GATEWAY_TIMEOUT,
+                    format!(
+                        "zeroclaw didn't respond within {}s. The agent may be \
+                         running a long tool loop (web search etc.). Bump \
+                         [zeroclaw] timeout_secs in companion.toml.",
+                        elapsed
+                    ),
+                )
+            } else {
+                (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    format!("zeroclaw error: {e}"),
+                )
+            }
         })?;
+    tracing::info!(
+        "companion: /api/chat ← reply ({}c, {}s)",
+        reply.len(),
+        started.elapsed().as_secs()
+    );
 
     // Run subagent + TTS ONCE here, then fan rendered frames out to
     // every connected /ws/avatar viewer. Doing the work per-client

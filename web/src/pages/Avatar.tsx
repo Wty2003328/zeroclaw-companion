@@ -254,12 +254,19 @@ export default function Avatar() {
         body: JSON.stringify({ message: text }),
       });
       if (!resp.ok) {
-        console.error('Chat send failed:', resp.status, await resp.text());
-        appendTurn({
-          role: 'assistant',
-          text: `[error: ${resp.status} ${resp.statusText}]`,
-          ts: Date.now(),
-        });
+        const body = await resp.text();
+        console.error('Chat send failed:', resp.status, body);
+        // Show the human-readable detail companion-server returns —
+        // it explains exactly what went wrong (timeout / upstream error).
+        let display: string;
+        if (resp.status === 504) {
+          display = `⏱️  Timed out. ${body || 'The agent took too long; bump [zeroclaw] timeout_secs in companion.toml.'}`;
+        } else if (resp.status === 502) {
+          display = `🔌  Upstream zeroclaw failed: ${body || 'unknown error'}`;
+        } else {
+          display = `[error ${resp.status}] ${body || resp.statusText}`;
+        }
+        appendTurn({ role: 'assistant', text: display, ts: Date.now() });
       }
       // Note: assistant reply is appended via the onText WS handler, not
       // here. /api/chat returns the same text but the WS path delivers it
