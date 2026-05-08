@@ -27,6 +27,34 @@ pub fn run() {
         .compact()
         .init();
 
+    // Make WebView2 stop classifying our audio as a "communications"
+    // session. Windows otherwise treats non-browser hosts as voice
+    // apps and applies AGC + acoustic echo cancellation, producing
+    // the echo / processed-voice symptoms users hear in Tauri but
+    // not in Edge browser. These flags are read by the WebView2
+    // runtime before any window is created.
+    //
+    // - AudioServiceOutOfProcess: keep audio in-process so the WebView2
+    //   stream doesn't inherit a separate Windows audio session.
+    // - autoplay-policy=no-user-gesture-required: matches the user
+    //   intent in a single-purpose app shell.
+    #[cfg(target_os = "windows")]
+    {
+        let prev = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+        let extra = "--disable-features=AudioServiceOutOfProcess \
+                     --autoplay-policy=no-user-gesture-required";
+        let combined = if prev.is_empty() {
+            extra.to_string()
+        } else {
+            format!("{prev} {extra}")
+        };
+        // SAFETY: set_var is unsafe in edition 2024. We run before any
+        // window or other thread that would read env. Single-threaded init.
+        unsafe {
+            std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", combined);
+        }
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {

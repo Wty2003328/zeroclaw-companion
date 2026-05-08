@@ -1,0 +1,372 @@
+import { useEffect, useState } from 'react';
+import {
+  HTTP_BASE,
+  getDefaultServerUrl,
+  getServerUrl,
+  getStoredServerUrl,
+  setStoredServerUrl,
+} from '../lib/apiBase';
+
+interface ServerConfig {
+  avatar: {
+    enabled: boolean;
+    chat_language: string;
+    tts: {
+      engine: string;
+      language: string;
+      voice: string | null;
+      api_url: string | null;
+      speed: number;
+    };
+    subagent: {
+      enabled: boolean;
+      only_when_translating: boolean;
+      use_zeroclaw_webhook: boolean;
+      llm_model: string;
+      llm_base_url: string;
+      llm_api_key_set: boolean;
+      timeout_secs: number;
+    };
+    model: {
+      model_dir: string | null;
+      default_expression: string;
+      scale: number;
+      anchor: string;
+    };
+  } | null;
+}
+
+const TOML_HINT_KEY = 'companion.tomlHint.dismissed.v1';
+
+export default function Settings() {
+  const [cfg, setCfg] = useState<ServerConfig | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // Companion URL section state
+  const [serverInput, setServerInput] = useState<string>(getStoredServerUrl());
+  const [savedHint, setSavedHint] = useState<string | null>(null);
+
+  const [tomlHintDismissed, setTomlHintDismissed] = useState<boolean>(
+    () => localStorage.getItem(TOML_HINT_KEY) === '1'
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${HTTP_BASE}/api/config`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`config ${r.status}`);
+        return r.json();
+      })
+      .then((data: ServerConfig) => {
+        if (!cancelled) setCfg(data);
+      })
+      .catch((e) => {
+        if (!cancelled) setError((e as Error).message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleSaveUrl = () => {
+    const trimmed = serverInput.trim();
+    setStoredServerUrl(trimmed);
+    setSavedHint(
+      trimmed
+        ? `Saved. Reload to use ${trimmed}.`
+        : 'Cleared. Reload to use the default.'
+    );
+    setTimeout(() => setSavedHint(null), 4000);
+  };
+
+  const handleClearUrl = () => {
+    setStoredServerUrl('');
+    setServerInput('');
+    setSavedHint('Cleared. Reload to use the default.');
+    setTimeout(() => setSavedHint(null), 4000);
+  };
+
+  const dismissTomlHint = () => {
+    setTomlHintDismissed(true);
+    localStorage.setItem(TOML_HINT_KEY, '1');
+  };
+
+  const isUsingDefaultUrl = !getStoredServerUrl();
+
+  return (
+    <div style={{ padding: 32, maxWidth: 880, margin: '0 auto', overflow: 'auto', height: '100%' }}>
+      <h1 style={{ marginTop: 0, fontSize: 24 }}>Settings</h1>
+      <p style={{ color: '#888', fontSize: 13, marginTop: -4 }}>
+        UI-only settings persist in this browser/window. Server-side knobs
+        (subagent backend, TTS engine, etc.) live in <code style={{ color: '#aaa' }}>companion.toml</code>;
+        this page shows what's loaded.
+      </p>
+
+      {error && <ErrorBox message={error} />}
+
+      {/* ── Companion server connection ─────────────────────────── */}
+      <Section title="Server connection">
+        <div style={{ color: '#888', fontSize: 12, marginBottom: 8, lineHeight: 1.5 }}>
+          Where this UI talks to companion-server. Default is{' '}
+          <code style={{ color: '#aaa' }}>{getDefaultServerUrl()}</code>. Useful for
+          remote companion-server, custom port, or multiple instances.
+        </div>
+        <Row>
+          <input
+            type="text"
+            value={serverInput}
+            onChange={(e) => setServerInput(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && handleSaveUrl()}
+            placeholder={`${getDefaultServerUrl()}  (default)`}
+            style={inputStyle}
+          />
+          <Button onClick={handleSaveUrl} primary>Save</Button>
+          <Button onClick={handleClearUrl} disabled={isUsingDefaultUrl}>Reset</Button>
+        </Row>
+        <Hint tone={savedHint ? 'good' : 'muted'}>
+          {savedHint ?? `Currently using: ${getServerUrl()}${isUsingDefaultUrl ? ' (default)' : ' (custom)'}`}
+        </Hint>
+      </Section>
+
+      {/* ── Avatar / TTS ───────────────────────────────────────── */}
+      <Section title="Avatar">
+        {!cfg && !error && <Hint tone="muted">loading…</Hint>}
+        {cfg && !cfg.avatar && (
+          <Hint tone="warn">Avatar disabled in companion.toml. Set <code>[avatar] enabled = true</code>.</Hint>
+        )}
+        {cfg?.avatar && (
+          <>
+            <ReadonlyRow label="enabled" value={String(cfg.avatar.enabled)} />
+            <ReadonlyRow label="chat language" value={cfg.avatar.chat_language} />
+            <ReadonlyRow label="TTS language" value={cfg.avatar.tts.language} />
+            <ReadonlyRow label="TTS engine" value={cfg.avatar.tts.engine} />
+            <ReadonlyRow label="TTS voice" value={cfg.avatar.tts.voice ?? '—'} />
+            <ReadonlyRow label="TTS speed" value={cfg.avatar.tts.speed.toFixed(2)} />
+            <ReadonlyRow label="model dir" value={cfg.avatar.model.model_dir ?? '—'} />
+            <ReadonlyRow label="default expression" value={cfg.avatar.model.default_expression} />
+          </>
+        )}
+      </Section>
+
+      {/* ── Subagent (translation + expression LLM) ────────────── */}
+      <Section title="Avatar subagent">
+        {cfg?.avatar?.subagent && (
+          <>
+            <ReadonlyRow label="enabled" value={String(cfg.avatar.subagent.enabled)} />
+            <ReadonlyRow
+              label="backend"
+              value={
+                cfg.avatar.subagent.use_zeroclaw_webhook
+                  ? 'zeroclaw-webhook  (slow ~5–10s/turn; reuses zeroclaw keys)'
+                  : `direct LLM  ${cfg.avatar.subagent.llm_base_url}  (fast ~1–3s)`
+              }
+              tone={cfg.avatar.subagent.use_zeroclaw_webhook ? 'warn' : 'good'}
+            />
+            <ReadonlyRow label="model" value={cfg.avatar.subagent.llm_model || '—'} />
+            <ReadonlyRow
+              label="API key"
+              value={cfg.avatar.subagent.llm_api_key_set ? '✓ set' : '✗ not set'}
+            />
+            <ReadonlyRow
+              label="only when translating"
+              value={cfg.avatar.subagent.only_when_translating ? 'yes (skip same-language)' : 'no (always run)'}
+            />
+            <ReadonlyRow label="timeout" value={`${cfg.avatar.subagent.timeout_secs}s`} />
+            {cfg.avatar.subagent.use_zeroclaw_webhook && !tomlHintDismissed && (
+              <SubagentSpeedupHint onDismiss={dismissTomlHint} />
+            )}
+          </>
+        )}
+      </Section>
+    </div>
+  );
+}
+
+function SubagentSpeedupHint({ onDismiss }: { onDismiss: () => void }) {
+  return (
+    <div
+      style={{
+        marginTop: 12,
+        padding: 14,
+        background: '#1e2433',
+        border: '1px solid #2d3a55',
+        borderRadius: 8,
+        fontSize: 12,
+        color: '#cbd5e1',
+        lineHeight: 1.55,
+        position: 'relative',
+      }}
+    >
+      <button
+        type="button"
+        onClick={onDismiss}
+        title="Dismiss"
+        style={{
+          position: 'absolute',
+          top: 8,
+          right: 8,
+          background: 'transparent',
+          border: 'none',
+          color: '#888',
+          cursor: 'pointer',
+          fontSize: 14,
+        }}
+      >
+        ✕
+      </button>
+      <div style={{ fontWeight: 600, color: '#fff', marginBottom: 6 }}>
+        💡 Subagent speed-up
+      </div>
+      You're routing every subagent call through zeroclaw's full agent
+      loop (memory, tools, system prompts) — that adds 5–10s per turn.
+      The subagent only needs a tiny LLM to emit JSON, so a direct call
+      to a small model is much faster.
+      <pre
+        style={{
+          marginTop: 10,
+          padding: 10,
+          background: '#0b0d10',
+          border: '1px solid #2a2d33',
+          borderRadius: 6,
+          fontSize: 11,
+          color: '#a5b4fc',
+          overflow: 'auto',
+        }}
+      >
+{`# in companion.toml
+[avatar.subagent]
+enabled              = true
+use_zeroclaw_webhook = false       # ← key change
+only_when_translating = true       # skip when chat_lang == tts_lang
+
+[avatar.subagent.llm]
+base_url     = "https://api.openai.com/v1"
+model        = "gpt-4o-mini"       # ~1s, cheap
+api_key_env  = "OPENAI_API_KEY"    # set the env var
+timeout_secs = 10`}
+      </pre>
+      <div style={{ marginTop: 6, color: '#94a3b8' }}>
+        Other fast options: Groq Llama-3.3-70B (~0.5s),
+        Ollama on localhost:11434/v1 (free, local), DeepSeek, Z.ai GLM-4-Flash.
+        Restart companion-server after editing companion.toml.
+      </div>
+    </div>
+  );
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section
+      style={{
+        background: '#16181c',
+        borderRadius: 10,
+        padding: 20,
+        marginTop: 16,
+      }}
+    >
+      <h2 style={{ margin: '0 0 12px 0', fontSize: 14, fontWeight: 600 }}>{title}</h2>
+      {children}
+    </section>
+  );
+}
+
+function Row({ children }: { children: React.ReactNode }) {
+  return (
+    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>{children}</div>
+  );
+}
+
+function ReadonlyRow({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: string;
+  tone?: 'good' | 'warn' | 'muted';
+}) {
+  const color = tone === 'good' ? '#10b981' : tone === 'warn' ? '#f59e0b' : '#cbd5e1';
+  return (
+    <div
+      style={{
+        display: 'flex',
+        gap: 12,
+        padding: '6px 0',
+        borderBottom: '1px solid #1f2227',
+        fontSize: 13,
+      }}
+    >
+      <span style={{ minWidth: 160, color: '#888' }}>{label}</span>
+      <span style={{ color, fontFamily: 'ui-monospace, monospace', fontSize: 12, wordBreak: 'break-all' }}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function Hint({ tone, children }: { tone: 'muted' | 'good' | 'warn'; children: React.ReactNode }) {
+  const color = tone === 'good' ? '#10b981' : tone === 'warn' ? '#f59e0b' : '#666';
+  return <div style={{ marginTop: 8, fontSize: 11, color }}>{children}</div>;
+}
+
+function ErrorBox({ message }: { message: string }) {
+  return (
+    <div
+      style={{
+        background: '#1f1316',
+        color: '#fca5a5',
+        padding: 12,
+        borderRadius: 8,
+        marginTop: 16,
+        fontSize: 13,
+      }}
+    >
+      Failed to load config: {message}
+    </div>
+  );
+}
+
+function Button({
+  children,
+  onClick,
+  primary,
+  disabled,
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+  primary?: boolean;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        padding: '8px 14px',
+        background: primary && !disabled ? '#3b82f6' : 'transparent',
+        color: primary && !disabled ? '#fff' : '#888',
+        border: primary && !disabled ? 'none' : '1px solid #2a2d33',
+        borderRadius: 6,
+        fontSize: 13,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.4 : 1,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+const inputStyle: React.CSSProperties = {
+  flex: '1 1 280px',
+  minWidth: 220,
+  background: '#0b0d10',
+  color: '#fff',
+  padding: '8px 12px',
+  borderRadius: 6,
+  border: '1px solid #2a2d33',
+  fontSize: 13,
+  fontFamily: 'monospace',
+  outline: 'none',
+};

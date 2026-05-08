@@ -4,6 +4,7 @@ import { BrowserRouter, Link, Navigate, Route, Routes } from 'react-router-dom';
 const Home = lazy(() => import('./pages/Home'));
 const Avatar = lazy(() => import('./pages/Avatar'));
 const Pulse = lazy(() => import('./pages/Pulse'));
+const Settings = lazy(() => import('./pages/Settings'));
 
 export default function App() {
   return (
@@ -16,6 +17,7 @@ export default function App() {
               <Route path="/" element={<Home />} />
               <Route path="/avatar" element={<Avatar />} />
               <Route path="/pulse" element={<Pulse />} />
+              <Route path="/settings" element={<Settings />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </Suspense>
@@ -48,6 +50,7 @@ function Nav() {
       <NavLink to="/" label="Home" />
       <NavLink to="/avatar" label="Avatar" />
       <NavLink to="/pulse" label="Pulse" />
+      <NavLink to="/settings" label="Settings" />
     </nav>
   );
 }

@@ -78,7 +78,8 @@ async fn main() -> Result<()> {
     let mut router = Router::new()
         .route("/health", get(handle_health))
         .route("/api/status", get(handle_status))
-        .route("/api/chat", axum::routing::post(handle_chat));
+        .route("/api/chat", axum::routing::post(handle_chat))
+        .route("/api/config", get(handle_get_config));
 
     if app_state.avatar.is_some() {
         let avatar_state = Arc::clone(app_state.avatar.as_ref().unwrap());
@@ -370,6 +371,49 @@ async fn handle_status(
         "zeroclaw_up": zc_up,
         "avatar_enabled": state.avatar.is_some(),
         "pulse_enabled": state.pulse.is_some(),
+    }))
+}
+
+/// Read-only snapshot of the loaded companion configuration so the
+/// Settings page can render what's actually running. Sensitive fields
+/// (api keys) are redacted.
+async fn handle_get_config(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::Json<serde_json::Value> {
+    let avatar = state.avatar.as_ref().map(|a| {
+        let cfg = &a.config;
+        serde_json::json!({
+            "enabled": cfg.enabled,
+            "chat_language": cfg.chat_language,
+            "tts": {
+                "engine": cfg.tts.engine,
+                "language": cfg.tts.language,
+                "voice": cfg.tts.voice,
+                "api_url": cfg.tts.api_url,
+                "speed": cfg.tts.speed,
+            },
+            "subagent": {
+                "enabled": cfg.subagent.enabled,
+                "only_when_translating": cfg.subagent.only_when_translating,
+                "use_zeroclaw_webhook": cfg.subagent.use_zeroclaw_webhook,
+                "llm_model": cfg.subagent.llm.model,
+                "llm_base_url": cfg.subagent.llm.base_url,
+                "timeout_secs": cfg.subagent.timeout_secs,
+                // api_key intentionally redacted
+                "llm_api_key_set": cfg.subagent.llm.api_key.is_some()
+                    || cfg.subagent.llm.api_key_env.is_some(),
+            },
+            "model": {
+                "model_dir": cfg.model.model_dir,
+                "default_expression": cfg.model.default_expression,
+                "scale": cfg.model.scale,
+                "anchor": cfg.model.anchor,
+            },
+        })
+    });
+    axum::Json(serde_json::json!({
+        "avatar": avatar,
+        "zeroclaw_url": state.zeroclaw.health().await.ok().map(|_| "ok"),
     }))
 }
 
