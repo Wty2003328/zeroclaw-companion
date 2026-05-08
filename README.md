@@ -100,12 +100,25 @@ zeroclaw-companion/
 ```bash
 # Workspace-level
 cargo check --workspace
-cargo test --workspace
+cargo test --workspace          # 80+ unit + integration tests
 cargo clippy --workspace --all-targets
 
 # Frontend (with hot reload + proxy to companion-server)
 cd web && npm run dev    # http://127.0.0.1:5173
 ```
+
+## Smoke check a running stack
+
+```bash
+./scripts/smoke.sh        # Linux / macOS / git-bash
+.\scripts\smoke.ps1       # Windows PowerShell
+```
+
+Probes zeroclaw `/health`, companion `/health` + `/api/status`, the TTS
+port `/health` and a real `/tts` round trip, plus Pulse if enabled.
+Tells you exactly which layer is down. Step-by-step manual recipe with
+expected log output and a failure-tree table is in
+`docs/E2E-SMOKE-TEST.md`.
 
 ## Status
 

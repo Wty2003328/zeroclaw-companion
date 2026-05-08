@@ -199,4 +199,98 @@ mod tests {
         let a: SubagentAnalysis = serde_json::from_str(json).unwrap();
         assert!(a.translated_text.is_none());
     }
+
+    #[test]
+    fn parses_response_with_motion() {
+        let json = r#"{
+            "expression": "F04",
+            "intensity": 0.8,
+            "motion": {"group": "TapBody", "index": 2}
+        }"#;
+        let a: SubagentAnalysis = serde_json::from_str(json).unwrap();
+        let m = a.motion.expect("motion");
+        assert_eq!(m.group, "TapBody");
+        assert_eq!(m.index, 2);
+    }
+
+    #[test]
+    fn to_expression_uses_subagent_fields() {
+        let analysis = SubagentAnalysis {
+            expression: "F03".into(),
+            intensity: 0.85,
+            motion: None,
+            translated_text: None,
+        };
+        let fallback = Live2DExpression {
+            name: "neutral".into(),
+            intensity: 0.5,
+            duration_ms: Some(1000),
+        };
+        let out = AvatarSubagent::to_expression(&analysis, &fallback);
+        assert_eq!(out.name, "F03");
+        assert!((out.intensity - 0.85).abs() < f32::EPSILON);
+        // duration_ms always inherits from the keyword fallback (subagent
+        // doesn't return one)
+        assert_eq!(out.duration_ms, Some(1000));
+    }
+
+    #[test]
+    fn to_expression_falls_back_on_invalid_intensity() {
+        let analysis = SubagentAnalysis {
+            expression: "F03".into(),
+            intensity: -0.5,
+            motion: None,
+            translated_text: None,
+        };
+        let fallback = Live2DExpression {
+            name: "neutral".into(),
+            intensity: 0.5,
+            duration_ms: None,
+        };
+        let out = AvatarSubagent::to_expression(&analysis, &fallback);
+        assert!((out.intensity - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn to_expression_falls_back_on_empty_name() {
+        let analysis = SubagentAnalysis {
+            expression: "".into(),
+            intensity: 0.7,
+            motion: None,
+            translated_text: None,
+        };
+        let fallback = Live2DExpression {
+            name: "F01".into(),
+            intensity: 0.5,
+            duration_ms: None,
+        };
+        let out = AvatarSubagent::to_expression(&analysis, &fallback);
+        assert_eq!(out.name, "F01");
+    }
+
+    #[test]
+    fn rejects_intensity_above_one_and_falls_back() {
+        let analysis = SubagentAnalysis {
+            expression: "F02".into(),
+            intensity: 1.5,
+            motion: None,
+            translated_text: None,
+        };
+        let fallback = Live2DExpression {
+            name: "neutral".into(),
+            intensity: 0.6,
+            duration_ms: None,
+        };
+        let out = AvatarSubagent::to_expression(&analysis, &fallback);
+        assert!((out.intensity - 0.6).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn default_system_prompt_contains_substitution_markers() {
+        // The template is loaded at construction time and {chat_lang} /
+        // {tts_lang} are substituted at call time. Make sure the canonical
+        // template has both markers.
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("{chat_lang}"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("{tts_lang}"));
+    }
 }

@@ -239,4 +239,80 @@ mod tests {
         let rms = compute_rms(&samples);
         assert!((rms - 1.0).abs() < 0.001, "expected 1.0, got {rms}");
     }
+
+    #[test]
+    fn analyze_returns_at_least_one_frame_for_short_audio() {
+        let config = default_config();
+        let analyzer = LipSyncAnalyzer::new(&config);
+        let tiny: Vec<i16> = vec![0; 10]; // way under one frame's window
+        let audio = super::super::tts_server::AudioOutput {
+            audio_bytes: make_wav_audio(&tiny),
+            sample_rate: 22050,
+            channels: 1,
+            format: "wav".into(),
+        };
+        let data = analyzer.analyze(&audio);
+        assert!(!data.frames.is_empty(), "must always emit at least one frame");
+    }
+
+    #[test]
+    fn analyze_unsupported_format_returns_silent_frame() {
+        let config = default_config();
+        let analyzer = LipSyncAnalyzer::new(&config);
+        let audio = super::super::tts_server::AudioOutput {
+            audio_bytes: vec![1, 2, 3, 4, 5],
+            sample_rate: 22050,
+            channels: 1,
+            format: "mp3".into(),
+        };
+        let data = analyzer.analyze(&audio);
+        assert!(!data.frames.is_empty());
+        assert!(data.frames[0].mouth_open < 0.01);
+    }
+
+    #[test]
+    fn analyze_uses_configured_fps_for_frame_duration() {
+        let mut config = default_config();
+        config.fps = 60;
+        let analyzer = LipSyncAnalyzer::new(&config);
+        let samples: Vec<i16> = vec![0; 22050];
+        let audio = super::super::tts_server::AudioOutput {
+            audio_bytes: make_wav_audio(&samples),
+            sample_rate: 22050,
+            channels: 1,
+            format: "wav".into(),
+        };
+        let data = analyzer.analyze(&audio);
+        // 60 fps → ~16.66ms per frame, rounded down to 16
+        assert!(
+            (15..=17).contains(&data.frame_duration_ms),
+            "expected ~16ms frame, got {}",
+            data.frame_duration_ms
+        );
+    }
+
+    #[test]
+    fn smoothing_clamps_within_zero_one() {
+        let config = default_config();
+        let analyzer = LipSyncAnalyzer::new(&config);
+        // Mix of huge and tiny samples → smoothed values should still
+        // be within [0, 1] (mouth_open is RMS-based, can't exceed 1).
+        let mixed: Vec<i16> = (0..22050)
+            .map(|i| if i % 100 == 0 { i16::MAX } else { 0 })
+            .collect();
+        let audio = super::super::tts_server::AudioOutput {
+            audio_bytes: make_wav_audio(&mixed),
+            sample_rate: 22050,
+            channels: 1,
+            format: "wav".into(),
+        };
+        let data = analyzer.analyze(&audio);
+        for f in &data.frames {
+            assert!(
+                (0.0..=1.0).contains(&f.mouth_open),
+                "mouth_open {} out of [0,1]",
+                f.mouth_open
+            );
+        }
+    }
 }

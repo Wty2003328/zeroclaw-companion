@@ -192,4 +192,37 @@ mod tests {
         let cleaned = mapper.strip_tags("Hello world!");
         assert_eq!(cleaned, "Hello world!");
     }
+
+    #[test]
+    fn strip_tags_handles_multiple_tags() {
+        let mapper = ExpressionMapper::new(&test_config());
+        let cleaned = mapper.strip_tags("[emotion:happy] Hi [emotion:sad] there");
+        assert!(!cleaned.contains("[emotion:"));
+        assert!(cleaned.contains("Hi"));
+        assert!(cleaned.contains("there"));
+    }
+
+    #[test]
+    fn keyword_is_case_insensitive() {
+        let mapper = ExpressionMapper::new(&test_config());
+        let expr = mapper.detect("WOW that's amazing");
+        assert_eq!(expr.name, "surprised");
+    }
+
+    #[test]
+    fn llm_tag_unmapped_emotion_uses_emotion_name_directly() {
+        let mut config = test_config();
+        config.detection_mode = "llm_tag".to_string();
+        let mapper = ExpressionMapper::new(&config);
+        let expr = mapper.detect("[emotion:joyful]");
+        assert_eq!(expr.name, "joyful");
+        assert!((expr.intensity - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn keyword_default_when_text_only_has_neutral_words() {
+        let mapper = ExpressionMapper::new(&test_config());
+        let expr = mapper.detect("");
+        assert_eq!(expr.name, "neutral");
+    }
 }

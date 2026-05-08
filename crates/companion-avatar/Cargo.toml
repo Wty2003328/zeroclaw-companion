@@ -25,3 +25,6 @@ regex.workspace = true
 
 [dev-dependencies]
 toml.workspace = true
+# axum + tokio with full features so tests can spin up an ephemeral
+# mock TTS server on a random port and exercise the wire contract end-to-end.
+tokio = { workspace = true, features = ["full"] }
