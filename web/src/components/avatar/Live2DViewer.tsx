@@ -74,6 +74,16 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
         autoStart: true,
         resizeTo: canvasRef.current.parentElement ?? undefined,
       });
+      // Silence pixi-live2d-display@0.4.0's "isInteractive is not a
+      // function" pointer-event spam: that library targets an older
+      // PIXI v7 event API. We never need PIXI to do hit-testing on
+      // the model (interaction lives in our React UI), so just turn
+      // the event system off entirely.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stage = app.stage as any;
+      stage.interactive = false;
+      stage.interactiveChildren = false;
+      stage.eventMode = 'none';
       appRef.current = app;
     } catch (e) {
       setError(`PIXI init failed: ${e}`);
@@ -106,6 +116,16 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
         model.scale.set(s);
         model.x = (appW - model.width * s) / 2;
         model.y = (appH - model.height * s) / 2;
+
+        // Disable interaction on the model and all its children so
+        // PIXI's event system doesn't walk into Live2D nodes that
+        // don't implement the v7+ interactive API (causes the
+        // "t.isInteractive is not a function" console spam).
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const m = model as any;
+        m.interactive = false;
+        m.interactiveChildren = false;
+        m.eventMode = 'none';
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (appRef.current.stage as any).addChild(model);
