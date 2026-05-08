@@ -30,13 +30,22 @@ use crate::protocol::{AvatarMessage, AvatarNotification};
 use crate::subagent::AvatarSubagent;
 use crate::tts_server::AnimeTtsManager;
 
-/// Events published by the companion's SSE bridge (or any other producer)
-/// and consumed by the avatar WebSocket handler.
+/// Events published by the companion-server's chat handler and consumed
+/// by every connected `/ws/avatar` client.
+///
+/// The expensive work (subagent translation + TTS synthesis) runs ONCE,
+/// PER TURN, on the producer side. The resulting frames are broadcast
+/// pre-rendered. This keeps:
+/// - subagent token usage flat regardless of how many viewers are open
+/// - TTS load flat (one synthesis per turn, not N)
+/// - audio playback synchronized — every viewer plays the same bytes
 #[derive(Debug, Clone)]
 pub enum AvatarEvent {
-    /// Agent completed a turn; synthesize and animate.
-    Speak { text: String },
-    /// Trigger a motion on the avatar.
+    /// Pre-rendered notification to fan out to every client. Producer
+    /// sends one of these for each frame in the sequence
+    /// (Expression → Motion? → Text → Debug → Audio → Idle).
+    Frame(AvatarNotification),
+    /// Trigger a motion on the avatar (manual override path).
     Motion { group: String, name: String },
     /// Shutdown signal.
     Shutdown,
@@ -113,14 +122,8 @@ async fn handle_avatar_socket(mut socket: WebSocket, state: Arc<AvatarWsState>) 
 
             event = event_rx.recv() => {
                 match event {
-                    Ok(AvatarEvent::Speak { text }) => {
-                        if let Err(e) = handle_speak_event(&mut socket, &state, &text).await {
-                            tracing::error!("avatar: error processing speak event: {e}");
-                            let err_msg = AvatarNotification::Error {
-                                message: format!("TTS error: {e}"),
-                            };
-                            let _ = send_notification(&mut socket, &err_msg).await;
-                        }
+                    Ok(AvatarEvent::Frame(frame)) => {
+                        let _ = send_notification(&mut socket, &frame).await;
                     }
                     Ok(AvatarEvent::Motion { group, name }) => {
                         let motion = AvatarNotification::Motion { group, name };
@@ -138,21 +141,24 @@ async fn handle_avatar_socket(mut socket: WebSocket, state: Arc<AvatarWsState>) 
     }
 }
 
-async fn handle_speak_event(
-    socket: &mut WebSocket,
-    state: &Arc<AvatarWsState>,
-    text: &str,
-) -> Result<()> {
+/// Producer-side: run subagent + TTS ONCE, then broadcast each rendered
+/// frame to all connected viewers. Call this from the chat handler
+/// (or anywhere else that wants the avatar to speak); never call it
+/// from a per-client task.
+///
+/// Returns the chat-language reply text on success so the caller can
+/// echo it (e.g. as the synchronous /api/chat response body).
+pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<String> {
+    let chat_lang = state.config.chat_language.clone();
+    let tts_lang = state.config.tts.language.clone();
     let expression_mapper = ExpressionMapper::new(&state.config.expressions);
-    let chat_lang = state.config.chat_language.as_str();
-    let tts_lang = state.config.tts.language.as_str();
 
     let keyword_expr = expression_mapper.detect(text);
     let mut motion_to_send: Option<AvatarNotification> = None;
     let mut subagent_used = false;
 
     let (expression, tts_text_opt) = if let Some(ref subagent) = state.subagent {
-        match subagent.analyze(text, chat_lang, tts_lang).await {
+        match subagent.analyze(text, &chat_lang, &tts_lang).await {
             Some(analysis) => {
                 subagent_used = true;
                 if let Some(ref motion) = analysis.motion {
@@ -187,44 +193,48 @@ async fn handle_speak_event(
         }
     };
 
-    let expr_name_for_debug = expression.name.clone();
-    let expr = AvatarNotification::Expression {
-        name: expression.name,
-        intensity: expression.intensity,
-        duration_ms: expression.duration_ms,
-    };
-    send_notification(socket, &expr).await?;
-
-    if let Some(motion) = motion_to_send {
-        send_notification(socket, &motion).await?;
-    }
-
-    let text_msg = AvatarNotification::Text {
-        content: subtitle_text.clone(),
-    };
-    send_notification(socket, &text_msg).await?;
-
-    // Diagnostic frame: surfaces what the subagent actually sent to TTS
-    // so the user can sanity-check the translation is happening.
-    let debug_msg = AvatarNotification::Debug {
-        chat_text: subtitle_text.clone(),
-        spoken_text: tts_text.clone(),
-        expression: expr_name_for_debug,
-        subagent_used,
-    };
-    send_notification(socket, &debug_msg).await?;
     tracing::info!(
-        "avatar: chat_lang={chat_lang} → tts_lang={tts_lang}, subagent_used={subagent_used}, \
-         chat_chars={}, spoken_chars={}",
+        "avatar: process_speak (chat_lang={chat_lang} → tts_lang={tts_lang}, \
+         subagent_used={subagent_used}, chat_chars={}, spoken_chars={}, \
+         subscribers={})",
         subtitle_text.chars().count(),
         tts_text.chars().count(),
+        state.event_tx.receiver_count(),
     );
 
-    match state.tts.synthesize_with(&tts_text, tts_lang).await {
+    let bcast = |frame: AvatarNotification| {
+        // Send returns Err if there are zero receivers; that's fine,
+        // we just skip the broadcast in that case.
+        let _ = state.event_tx.send(AvatarEvent::Frame(frame));
+    };
+
+    bcast(AvatarNotification::Expression {
+        name: expression.name.clone(),
+        intensity: expression.intensity,
+        duration_ms: expression.duration_ms,
+    });
+
+    if let Some(motion) = motion_to_send {
+        bcast(motion);
+    }
+
+    bcast(AvatarNotification::Text {
+        content: subtitle_text.clone(),
+    });
+
+    bcast(AvatarNotification::Debug {
+        chat_text: subtitle_text.clone(),
+        spoken_text: tts_text.clone(),
+        expression: expression.name,
+        subagent_used,
+    });
+
+    // ONE TTS call per turn — not one per connected client.
+    match state.tts.synthesize_with(&tts_text, &tts_lang).await {
         Ok(audio) => {
             use base64::Engine;
             let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&audio.audio_bytes);
-            let audio_msg = AvatarNotification::Audio {
+            bcast(AvatarNotification::Audio {
                 audio: audio_b64,
                 format: audio.format,
                 sample_rate: audio.sample_rate,
@@ -232,17 +242,15 @@ async fn handle_speak_event(
                     frames: Vec::new(),
                     frame_duration_ms: 30,
                 },
-            };
-            send_notification(socket, &audio_msg).await?;
+            });
         }
         Err(e) => {
             tracing::warn!("avatar: TTS synthesize failed ({e}), skipping audio");
         }
     }
 
-    let idle = AvatarNotification::Idle;
-    send_notification(socket, &idle).await?;
-    Ok(())
+    bcast(AvatarNotification::Idle);
+    Ok(subtitle_text)
 }
 
 fn handle_avatar_message(msg: &AvatarMessage) {

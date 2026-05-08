@@ -31,12 +31,20 @@ interface CanvasPrefs {
   background: string;     // CSS color, e.g. '#0a0a0a' or 'transparent'
   transparent: boolean;
   showControls: boolean;  // expressions/motions panel
+  /** Multiplier on the auto-fit scale. 1 = fit to canvas, >1 zooms in. */
+  scaleMultiplier: number;
+  /** Pixel offset from the canvas center, after auto-fit. */
+  offsetX: number;
+  offsetY: number;
 }
 const PREFS_KEY = 'companion.avatarPrefs.v1';
 const DEFAULT_PREFS: CanvasPrefs = {
   background: '#0a0a0a',
   transparent: false,
   showControls: false, // hidden by default per user request
+  scaleMultiplier: 1,
+  offsetX: 0,
+  offsetY: 0,
 };
 function loadPrefs(): CanvasPrefs {
   try {
@@ -307,6 +315,9 @@ export default function Avatar() {
               lipSyncData={lipSyncData}
               isPlaying={isPlaying}
               onActionsReady={setModelActions}
+              scaleMultiplier={prefs.scaleMultiplier}
+              offsetX={prefs.offsetX}
+              offsetY={prefs.offsetY}
             />
           ) : (
             <div
@@ -818,6 +829,84 @@ function CanvasSettingsPopover({
           Show expression / motion controls
         </label>
       </div>
+
+      <div style={{ borderTop: '1px solid #2a2d33', paddingTop: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+          <span style={{ fontSize: 12, color: '#aaa' }}>Model</span>
+          <button
+            type="button"
+            onClick={() => onChange({ ...prefs, scaleMultiplier: 1, offsetX: 0, offsetY: 0 })}
+            style={{
+              background: 'transparent',
+              color: '#888',
+              border: '1px solid #2a2d33',
+              borderRadius: 4,
+              padding: '2px 8px',
+              fontSize: 11,
+              cursor: 'pointer',
+            }}
+          >
+            Reset
+          </button>
+        </div>
+        <SliderRow
+          label="Zoom"
+          value={prefs.scaleMultiplier}
+          min={0.3} max={3} step={0.05}
+          fmt={(v) => `${(v * 100).toFixed(0)}%`}
+          onChange={(v) => onChange({ ...prefs, scaleMultiplier: v })}
+        />
+        <SliderRow
+          label="X offset"
+          value={prefs.offsetX}
+          min={-400} max={400} step={5}
+          fmt={(v) => `${Math.round(v)}px`}
+          onChange={(v) => onChange({ ...prefs, offsetX: v })}
+        />
+        <SliderRow
+          label="Y offset"
+          value={prefs.offsetY}
+          min={-400} max={400} step={5}
+          fmt={(v) => `${Math.round(v)}px`}
+          onChange={(v) => onChange({ ...prefs, offsetY: v })}
+        />
+      </div>
+    </div>
+  );
+}
+
+function SliderRow({
+  label,
+  value,
+  min,
+  max,
+  step,
+  fmt,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  fmt: (v: number) => string;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 6 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#888' }}>
+        <span>{label}</span>
+        <span style={{ fontFamily: 'monospace' }}>{fmt(value)}</span>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        style={{ width: '100%', accentColor: '#3b82f6' }}
+      />
     </div>
   );
 }

@@ -275,22 +275,39 @@ async fn build_pulse(cfg: &CompanionConfig) -> Result<Option<Arc<PulseSubsystem>
     Ok(Some(Arc::new(subsystem)))
 }
 
-/// Subscribe to zeroclaw's SSE event stream and forward agent replies to
-/// the avatar broadcast channel. Reconnects on failure with exponential
-/// backoff capped at 30s.
-async fn run_sse_bridge(zc: ZeroclawClient, tx: broadcast::Sender<AvatarEvent>) {
+/// Subscribe to zeroclaw's SSE event stream for OBSERVABILITY only.
+///
+/// We deliberately do NOT use SSE to drive the avatar pipeline:
+/// (1) zeroclaw v0.7.5's /api/events doesn't broadcast the reply text
+///     anyway (only agent_start / llm_request / agent_end metadata),
+///     so any avatar-Speak we emitted here would have empty text, and
+/// (2) the load-bearing path is /api/chat → process_speak, which runs
+///     subagent + TTS exactly once per turn. Re-emitting via SSE would
+///     risk doubling that work and producing two simultaneous Asunas.
+///
+/// Reconnects on failure with exponential backoff capped at 30s.
+async fn run_sse_bridge(zc: ZeroclawClient, _avatar_tx: broadcast::Sender<AvatarEvent>) {
     let mut backoff = 1u64;
     loop {
         match zc.events().await {
             Ok(stream) => {
-                tracing::info!("companion: SSE bridge connected");
+                tracing::info!("companion: SSE bridge connected (observability only)");
                 backoff = 1;
                 tokio::pin!(stream);
                 while let Some(ev) = stream.next().await {
-                    if let AgentEvent::AgentReply { text, .. } = ev {
-                        // ignore receiver-count-zero errors; viewers may
-                        // not be connected yet
-                        let _ = tx.send(AvatarEvent::Speak { text });
+                    // Log unusual events at debug; AgentReply (if a future
+                    // zeroclaw ever emits one) is logged but NOT forwarded.
+                    match ev {
+                        AgentEvent::AgentReply { ref text, .. } => {
+                            tracing::debug!(
+                                "companion sse: agent.reply ({} chars) — ignored, /api/chat is the speak path",
+                                text.len()
+                            );
+                        }
+                        AgentEvent::AgentToken { .. } => {}
+                        AgentEvent::Other { ref raw } => {
+                            tracing::debug!("companion sse: {}", raw);
+                        }
                     }
                 }
                 tracing::warn!("companion: SSE stream ended; reconnecting");
@@ -397,10 +414,18 @@ async fn handle_chat(
             )
         })?;
 
-    // Fan out to the avatar so it speaks the reply.
+    // Run subagent + TTS ONCE here, then fan rendered frames out to
+    // every connected /ws/avatar viewer. Doing the work per-client
+    // would multiply subagent token cost and TTS load by the number of
+    // connected viewers and make all of them play overlapping audio.
     if let Some(ref avatar) = state.avatar {
-        let _ = avatar.event_tx.send(companion_avatar::AvatarEvent::Speak {
-            text: reply.clone(),
+        let avatar_clone = std::sync::Arc::clone(avatar);
+        let reply_clone = reply.clone();
+        // Spawn so we don't block the /api/chat response on TTS time.
+        tokio::spawn(async move {
+            if let Err(e) = companion_avatar::process_speak(&avatar_clone, &reply_clone).await {
+                tracing::warn!("companion: process_speak failed: {e}");
+            }
         });
     }
     Ok(axum::Json(ChatResponse { reply }))

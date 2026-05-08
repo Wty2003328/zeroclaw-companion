@@ -33,4 +33,4 @@ pub use lip_sync::{LipSyncAnalyzer, LipSyncData, LipSyncFrame};
 pub use protocol::{AvatarMessage, AvatarNotification, LipSyncDataProto, LipSyncFrameProto};
 pub use subagent::{AvatarSubagent, SubagentAnalysis, SubagentMotion};
 pub use tts_server::{AnimeTtsManager, AudioOutput};
-pub use ws::{AvatarEvent, AvatarWsState, handle_ws_avatar};
+pub use ws::{AvatarEvent, AvatarWsState, handle_ws_avatar, process_speak};

@@ -49,6 +49,14 @@ interface Live2DViewerProps {
   lipSyncData?: LipSyncDataProto | null;
   isPlaying: boolean;
   onActionsReady?: (actions: ModelActions) => void;
+  /**
+   * User-adjustable transform overrides applied on top of the auto-fit.
+   * scaleMultiplier=1 means "use auto-fit"; >1 zooms in, <1 zooms out.
+   * offsetX/Y are pixels relative to the auto-fit center.
+   */
+  scaleMultiplier?: number;
+  offsetX?: number;
+  offsetY?: number;
 }
 
 const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
@@ -57,6 +65,9 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
   lipSyncData,
   isPlaying,
   onActionsReady,
+  scaleMultiplier = 1,
+  offsetX = 0,
+  offsetY = 0,
 }, ref) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const appRef = useRef<PIXI.Application | null>(null);
@@ -132,15 +143,20 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
         const model = await loadModel(modelUrl);
         if (cancelled || !appRef.current) return;
 
-        // Fit model to container
-        const appW = appRef.current.screen.width;
-        const appH = appRef.current.screen.height;
-        const scaleX = appW / model.width;
-        const scaleY = appH / model.height;
-        const s = Math.min(scaleX, scaleY) * 0.9;
-        model.scale.set(s);
-        model.x = (appW - model.width * s) / 2;
-        model.y = (appH - model.height * s) / 2;
+        // Stash the auto-fit transform so user-adjustable scale/offset
+        // can be re-applied without reloading the model. The second
+        // useEffect below reads `model.userData.autoFit` to recompute
+        // the live transform.
+        const fitModel = () => {
+          const appW = appRef.current!.screen.width;
+          const appH = appRef.current!.screen.height;
+          const scaleX = appW / model.width;
+          const scaleY = appH / model.height;
+          const fitScale = Math.min(scaleX, scaleY) * 0.9;
+          model.userData = model.userData || {};
+          model.userData.autoFit = { fitScale, appW, appH };
+        };
+        fitModel();
 
         // Disable interaction on the model and all its children so
         // PIXI's event system doesn't walk into Live2D nodes that
@@ -202,6 +218,39 @@ const Live2DViewer = forwardRef<Live2DViewerHandle, Live2DViewerProps>(({
       setLoaded(false);
     };
   }, [modelUrl]);
+
+  // Apply user-adjustable transform whenever it changes. We also
+  // re-apply on resize via a short ticker so the model stays centered
+  // when the canvas grows/shrinks.
+  useEffect(() => {
+    const applyTransform = () => {
+      const model = modelRef.current;
+      const app = appRef.current;
+      if (!model || !app) return;
+      const fit = model.userData?.autoFit;
+      if (!fit) return;
+      // Recompute fit if app size changed (window resize, panel toggle).
+      if (fit.appW !== app.screen.width || fit.appH !== app.screen.height) {
+        const scaleX = app.screen.width / model.width;
+        const scaleY = app.screen.height / model.height;
+        fit.fitScale = Math.min(scaleX, scaleY) * 0.9;
+        fit.appW = app.screen.width;
+        fit.appH = app.screen.height;
+      }
+      const finalScale = fit.fitScale * scaleMultiplier;
+      // Set scale first so model.width reflects the new size.
+      model.scale.set(finalScale);
+      const cx = (fit.appW - model.width) / 2;
+      const cy = (fit.appH - model.height) / 2;
+      model.x = cx + offsetX;
+      model.y = cy + offsetY;
+    };
+    applyTransform();
+    // Cheap re-check loop — handles "model just loaded" and "canvas resized"
+    // without setting up a ResizeObserver.
+    const id = setInterval(applyTransform, 250);
+    return () => clearInterval(id);
+  }, [scaleMultiplier, offsetX, offsetY, loaded]);
 
   // Drive lip sync animation
   useEffect(() => {
