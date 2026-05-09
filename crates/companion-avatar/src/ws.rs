@@ -33,6 +33,52 @@ fn safe_prefix(s: &str, max_bytes: usize) -> &str {
     }
     &s[..end]
 }
+
+/// Split a long agent reply into translation-sized chunks.
+///
+/// Used by process_speak when the bulk subagent.analyze() call didn't
+/// produce a translation (long inputs blow past z.ai's 60s connection
+/// budget). Per-paragraph translation keeps each LLM call small enough
+/// to land reliably, and we sequence them to stay under the per-key
+/// rate limit.
+///
+/// Strategy:
+/// - Split on blank lines (\n\n) first — most agent replies use them
+///   between bullets / numbered items / paragraphs.
+/// - For paragraphs longer than `MAX`, split further by sentence
+///   terminator so no single LLM call exceeds the safe input size.
+fn split_for_translation(text: &str) -> Vec<String> {
+    const MAX_CHARS_PER_CHUNK: usize = 280;
+    let mut out: Vec<String> = Vec::new();
+    for paragraph in text.split("\n\n") {
+        let p = paragraph.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if p.chars().count() <= MAX_CHARS_PER_CHUNK {
+            out.push(p.to_string());
+            continue;
+        }
+        // Long paragraph: subdivide on sentence terminators.
+        let parts = crate::config::split_sentences(p, 16);
+        if parts.is_empty() {
+            // Hard split if sentence splitter found nothing.
+            let mut buf = String::new();
+            for ch in p.chars() {
+                buf.push(ch);
+                if buf.chars().count() >= MAX_CHARS_PER_CHUNK {
+                    out.push(std::mem::take(&mut buf));
+                }
+            }
+            if !buf.trim().is_empty() {
+                out.push(buf);
+            }
+        } else {
+            out.extend(parts);
+        }
+    }
+    out
+}
 use tokio::sync::broadcast;
 
 use crate::config::AvatarConfig;
@@ -175,7 +221,15 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     let should_run_subagent = state.subagent.is_some()
         && (need_translation || !state.config.subagent.only_when_translating);
 
-    let (expression, tts_text_opt, clean_chat_opt) = if should_run_subagent {
+    // Skip the bulk subagent.analyze call when the input is large —
+    // those are exactly the cases where z.ai times out / 429s on the
+    // single big request. Per-paragraph translation handles them
+    // reliably below. We still want analyze() for SHORT replies
+    // because it picks the expression and translates in one call.
+    const BULK_ANALYZE_MAX_CHARS: usize = 500;
+    let bulk_eligible = text.chars().count() <= BULK_ANALYZE_MAX_CHARS;
+
+    let (expression, tts_text_opt, clean_chat_opt) = if should_run_subagent && bulk_eligible {
         let subagent = state.subagent.as_ref().unwrap();
         match subagent.analyze(text, &chat_lang, &tts_lang).await {
             Some(analysis) => {
@@ -194,7 +248,17 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
             None => (keyword_expr, None, None),
         }
     } else {
-        if state.subagent.is_some() && !need_translation {
+        if state.subagent.is_some() && should_run_subagent && !bulk_eligible {
+            tracing::info!(
+                "avatar: bulk subagent skipped — input {}c exceeds {} threshold; \
+                 routing to per-paragraph translation directly",
+                text.chars().count(), BULK_ANALYZE_MAX_CHARS
+            );
+            // Mark subagent as in-use so the Debug frame reflects that
+            // translation was attempted, even though the bulk path was
+            // bypassed for sizing reasons.
+            subagent_used = true;
+        } else if state.subagent.is_some() && !need_translation {
             tracing::debug!(
                 "avatar: subagent skipped (same language; only_when_translating=true)"
             );
@@ -211,32 +275,83 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
         Some(t) if !t.trim().is_empty() => expression_mapper.strip_tags(&t),
         _ => raw_subtitle.clone(),
     };
-    // tts_text is what the TTS engine actually synthesizes.
+    // Build the per-paragraph TTS chunk list.
     //
-    // - same-language: speak the subtitle as-is.
-    // - cross-language with translation: speak the translation.
-    // - cross-language WITHOUT translation (subagent failed): SKIP TTS.
-    //   Feeding English bytes to a Japanese-configured TTS produces
-    //   garbled phonetic transliteration that often sounds duplicated
-    //   ("thank you twice" reports trace back here). The user can
-    //   still read the chat bubble — silence is strictly better than
-    //   audibly-broken speech for that turn.
-    let tts_text = if chat_lang == tts_lang {
-        subtitle_text.clone()
+    // - same-language: chunk the subtitle by sentence (existing path).
+    // - cross-language: ALWAYS try translating each paragraph in its own
+    //   subagent call. The single-call subagent.analyze() already gave
+    //   us a translated_text candidate; we use it for short replies,
+    //   but for long replies it tends to time out / rate-limit at z.ai
+    //   (1KB+ inputs blow past the 60s connection budget). Per-paragraph
+    //   translation keeps each LLM call small and reliable, so the user
+    //   actually hears audio for long answers like "5 tips for sleep."
+    let tts_chunks: Vec<String> = if chat_lang == tts_lang {
+        // No translation needed — the streaming-TTS chunker handles
+        // the rest below.
+        vec![subtitle_text.clone()]
     } else {
-        match tts_text_opt {
-            Some(t) if !t.trim().is_empty() => expression_mapper.strip_tags(&t),
-            _ => {
-                tracing::warn!(
-                    "avatar: chat_language={chat_lang} != tts_language={tts_lang} \
-                     but subagent returned no translation; SKIPPING TTS \
-                     (subtitle still shown). Bump max_tokens or check the \
-                     LLM logs above for the parse/timeout reason."
-                );
-                String::new()
+        // Reuse the bulk-call translation IF it looks complete. We've
+        // observed z.ai returning translations truncated mid-codepoint
+        // when the JSON wrapper exceeds max_tokens — those parse as
+        // valid strings but only cover ~half the reply. Heuristic:
+        // accept the bulk translation only if it's at least 35% as long
+        // as the cleaned chat text. Otherwise fall through to
+        // per-paragraph translation so the user hears the full answer.
+        let bulk_translated = tts_text_opt
+            .as_deref()
+            .map(|t| expression_mapper.strip_tags(t))
+            .filter(|t| !t.trim().is_empty());
+        let bulk_complete = bulk_translated.as_ref().map(|t| {
+            let translated_chars = t.chars().count();
+            let source_chars = subtitle_text.chars().count().max(1);
+            // Japanese typically packs more meaning per char than
+            // English (factor ~0.5), so 0.35 is a generous floor.
+            (translated_chars as f32) / (source_chars as f32) >= 0.35
+        }).unwrap_or(false);
+        if bulk_complete {
+            let t = bulk_translated.unwrap();
+            tracing::info!(
+                "avatar: using bulk subagent translation ({} chars)",
+                t.chars().count()
+            );
+            vec![t]
+        } else if let Some(ref subagent) = state.subagent {
+            // Fall back to per-paragraph translation. Sequential to
+            // avoid bursting z.ai's per-key rate limit.
+            let paragraphs = split_for_translation(&subtitle_text);
+            tracing::info!(
+                "avatar: bulk translation missing; per-paragraph translating {} chunks",
+                paragraphs.len()
+            );
+            let mut out = Vec::with_capacity(paragraphs.len());
+            for (i, para) in paragraphs.iter().enumerate() {
+                if i > 0 {
+                    // Stay under z.ai's per-minute rate limit. 800ms
+                    // between calls + the call itself keeps us under
+                    // ~1 RPS, which the coding-paas endpoint tolerates.
+                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                }
+                if let Some(t) = subagent.translate_chunk(para, &tts_lang).await {
+                    let cleaned = expression_mapper.strip_tags(&t);
+                    if !cleaned.trim().is_empty() {
+                        out.push(cleaned);
+                    }
+                } else {
+                    tracing::warn!(
+                        "avatar: per-paragraph translate failed for chunk {}/{}",
+                        i + 1, paragraphs.len()
+                    );
+                }
             }
+            out
+        } else {
+            tracing::warn!(
+                "avatar: no subagent configured for cross-language; SKIPPING TTS"
+            );
+            Vec::new()
         }
     };
+    let tts_text = tts_chunks.join("\n");
 
     tracing::info!(
         "avatar: process_speak (chat_lang={chat_lang} → tts_lang={tts_lang}, \
@@ -298,8 +413,15 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
     // chunk arrives ~1–2s after the agent reply lands instead of
     // waiting for the full reply to render — the perceived latency
     // win for long replies.
+    //
+    // If the per-paragraph translator produced multiple chunks already,
+    // we feed those to TTS directly (each paragraph is its own
+    // synthesis unit). For a single bulk translation we still apply
+    // sentence-level chunking so streaming kicks in on long replies.
     let turn_id = uuid::Uuid::new_v4().to_string();
-    let chunks: Vec<String> = if state.config.tts.streaming {
+    let chunks: Vec<String> = if tts_chunks.len() > 1 {
+        tts_chunks
+    } else if state.config.tts.streaming {
         let parts = crate::config::split_sentences(
             &tts_text,
             state.config.tts.streaming_min_chars,
@@ -367,6 +489,43 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
 
     bcast(AvatarNotification::Idle);
     Ok(subtitle_text)
+}
+
+#[cfg(test)]
+mod split_for_translation_tests {
+    use super::split_for_translation;
+
+    #[test]
+    fn paragraphs_under_max_pass_through() {
+        let v = split_for_translation("First.\n\nSecond.\n\nThird.");
+        assert_eq!(v, vec!["First.", "Second.", "Third."]);
+    }
+
+    #[test]
+    fn long_paragraphs_subdivide_by_sentence() {
+        let p = "Sentence one is here. ".repeat(20); // ~440c, no \n\n
+        let v = split_for_translation(&p);
+        assert!(v.len() > 1, "expected multiple chunks for 440c paragraph");
+        for chunk in &v {
+            assert!(chunk.chars().count() <= 320, "chunk too long: {chunk:?}");
+        }
+    }
+
+    #[test]
+    fn empty_input_yields_empty() {
+        assert!(split_for_translation("").is_empty());
+        assert!(split_for_translation("   \n\n   ").is_empty());
+    }
+
+    #[test]
+    fn mixed_short_and_long_paragraphs() {
+        let long = "X is the case. ".repeat(30);
+        let input = format!("Short.\n\n{long}\n\nAlso short.");
+        let v = split_for_translation(&input);
+        assert_eq!(v.first().map(String::as_str), Some("Short."));
+        assert_eq!(v.last().map(String::as_str), Some("Also short."));
+        assert!(v.len() > 2, "long para should be subdivided");
+    }
 }
 
 fn handle_avatar_message(msg: &AvatarMessage) {

@@ -21,6 +21,16 @@ fn safe_prefix(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Strip surrounding ```...``` or ```json...``` fences that some
+/// instruction-following models can't help wrapping their output in.
+fn strip_code_fence(s: &str) -> &str {
+    s.trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim()
+}
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -229,6 +239,88 @@ impl AvatarSubagent {
                     tracing::warn!("avatar subagent: attempt {attempt} failed, retrying");
                 }
                 None => {}
+            }
+        }
+        None
+    }
+
+    /// Translate a single chunk of text. Plain output, no JSON. Designed
+    /// to be called per-paragraph for long replies — each call stays
+    /// small enough that z.ai's coding-paas endpoint doesn't choke
+    /// (its 60s connection budget + per-key rate limits both bite for
+    /// 1KB+ inputs in one shot).
+    ///
+    /// Retries with backoff on 429 (rate limit) — z.ai's per-key
+    /// minute-window quota is strict and a long reply may need
+    /// several seconds of breathing room between calls.
+    pub async fn translate_chunk(
+        &self,
+        text: &str,
+        target_language: &str,
+    ) -> Option<String> {
+        let prompt = format!(
+            "Translate the following text into {target_language}. \
+             Output ONLY the translation — no preamble, no quotation marks, \
+             no markdown decoration, no explanation. Preserve sentence \
+             count. If the text is already in {target_language}, return it \
+             unchanged.\n\nText:\n{text}",
+        );
+        // Cap per-attempt to 30s. Translate is meant for ~150c chunks
+        // that should complete in 1-5s; anything past 30s means the
+        // upstream LLM is wedged and burning more wall time on it just
+        // delays the user's audio further. With 2 retries × 30s, worst
+        // case is 60s per failed chunk vs 240s under self.timeout (60s)
+        // × 4 attempts.
+        let attempt_budget = std::cmp::min(self.timeout, Duration::from_secs(30));
+        for attempt in 1..=3 {
+            tracing::info!(
+                "avatar subagent.translate: → attempt={attempt} ({}c → {target_language}): {:?}",
+                text.chars().count(),
+                safe_prefix(text, 100),
+            );
+            let result = tokio::time::timeout(
+                attempt_budget,
+                self.backend.ask("", &prompt),
+            )
+            .await;
+            match result {
+                Ok(Ok(out)) => {
+                    let cleaned = strip_code_fence(out.trim()).trim().to_string();
+                    if cleaned.is_empty() {
+                        tracing::warn!(
+                            "avatar subagent.translate: empty response (attempt {attempt})"
+                        );
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    tracing::info!(
+                        "avatar subagent.translate: ← attempt={attempt} ({}c): {:?}",
+                        cleaned.chars().count(),
+                        safe_prefix(&cleaned, 100),
+                    );
+                    return Some(cleaned);
+                }
+                Ok(Err(e)) => {
+                    let msg = e.to_string();
+                    let is_rate_limit = msg.contains("429") || msg.contains("Rate limit");
+                    tracing::warn!(
+                        "avatar subagent.translate: LLM failed (attempt {attempt}): {e}"
+                    );
+                    if attempt < 3 {
+                        // Exponential backoff for 429, brief retry otherwise.
+                        let wait = if is_rate_limit { 1u64 << attempt } else { 1 };
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "avatar subagent.translate: timeout (attempt {attempt}) after {}s",
+                        attempt_budget.as_secs()
+                    );
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
             }
         }
         None
