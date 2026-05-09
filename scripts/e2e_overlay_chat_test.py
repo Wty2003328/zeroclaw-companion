@@ -67,16 +67,25 @@ def main() -> int:
         # is the compact one we render at the bottom.
         overlay_input = page_overlay.locator('input[type="text"]').first
         try:
-            overlay_input.wait_for(state="visible", timeout=10000)
+            overlay_input.wait_for(state="attached", timeout=10000)
             print("✓ overlay rendered a compact chat input")
         except Exception as e:
             fails += 1
-            print(f"✗ overlay has no chat input visible: {e}")
+            print(f"✗ overlay has no chat input attached: {e}")
             browser.close()
             return 1
 
+        # Reveal the chat bar (it has pointer-events:none until hover).
+        # In real Tauri the cursor naturally hovers when the user moves
+        # toward the pet; in headless we dispatch the bubbling mouseover
+        # that React's polyfilled onMouseEnter listens for.
+        page_overlay.locator('[data-tauri-drag-region=""]').first.dispatch_event(
+            "mouseover"
+        )
+        page_overlay.wait_for_timeout(300)
+
         # Type + submit from the OVERLAY page.
-        overlay_input.click()
+        overlay_input.click(force=True)
         overlay_input.fill(MSG)
         overlay_input.press("Enter")
 

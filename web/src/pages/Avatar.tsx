@@ -37,6 +37,24 @@ interface CanvasPrefs {
   /** Pixel offset from the canvas center, after auto-fit. */
   offsetX: number;
   offsetY: number;
+  /** Model rotation in degrees, around its visual center. */
+  rotation: number;
+  /** Mirror the model horizontally (left ↔ right). */
+  mirrorX: boolean;
+  /** Optional data-URL background image (overlays the solid color). */
+  bgImageUrl: string | null;
+  /** Background image opacity (0..1). */
+  bgImageOpacity: number;
+  /** Background image fit mode. */
+  bgImageFit: 'cover' | 'contain' | 'fill';
+  /** When true, the avatar plays a random Idle-group motion every
+   *  `idleMotionSecs` seconds while not currently speaking. */
+  idleMotion: boolean;
+  /** Seconds between idle motions. Long enough that the avatar looks
+   *  "alive" without spamming animations. */
+  idleMotionSecs: number;
+  /** Model gaze follows the mouse cursor over the canvas. */
+  eyeTracking: boolean;
 }
 const PREFS_KEY = 'companion.avatarPrefs.v1';
 const DEFAULT_PREFS: CanvasPrefs = {
@@ -46,6 +64,14 @@ const DEFAULT_PREFS: CanvasPrefs = {
   scaleMultiplier: 1,
   offsetX: 0,
   offsetY: 0,
+  rotation: 0,
+  mirrorX: false,
+  bgImageUrl: null,
+  bgImageOpacity: 1,
+  bgImageFit: 'cover',
+  idleMotion: false,
+  idleMotionSecs: 12,
+  eyeTracking: false,
 };
 function loadPrefs(): CanvasPrefs {
   try {
@@ -195,6 +221,16 @@ export default function Avatar() {
   // later, the onText handler REPLACES the just-added fallback turn
   // with the cleaner WS version instead of appending a duplicate.
   const httpFallbackFiredRef = useRef<string | null>(null);
+  // Snapshot of the model's available motions, kept in sync via
+  // onActionsReady. The Live2DViewer's idle-motion auto-play reads
+  // through this ref so it picks up new motions when a model swaps
+  // without re-rendering the viewer's effect deps.
+  const modelMotionsRef = useRef<{ group: string; index: number }[] | null>(null);
+  // True when the user's cursor is hovering the canvas. In overlay
+  // (desktop pet) mode this gates the visibility of the chat bar and
+  // corner buttons — the avatar floats chromeless on the desktop and
+  // the controls fade in only on demand. No effect in main window.
+  const [overlayHover, setOverlayHover] = useState(false);
   // Sentence-chunked playback queue. The companion server can send
   // several Audio frames per turn (one per sentence). Buffer them
   // here and drain sequentially via `drainQueue` so back-to-back
@@ -550,6 +586,8 @@ export default function Avatar() {
           // disabled interactivity on earlier for unsafe-eval reasons)
           // doesn't swallow the mouse event.
           {...(IS_OVERLAY ? { 'data-tauri-drag-region': '' } : {})}
+          onMouseEnter={IS_OVERLAY ? () => setOverlayHover(true) : undefined}
+          onMouseLeave={IS_OVERLAY ? () => setOverlayHover(false) : undefined}
           style={{
             flex: 1,
             position: 'relative',
@@ -566,6 +604,26 @@ export default function Avatar() {
             backgroundPosition: !IS_OVERLAY && prefs.transparent ? '0 0, 0 10px, 10px -10px, -10px 0px' : undefined,
           }}
         >
+          {/* User-supplied background image, painted ABOVE the solid
+              color and BELOW the avatar. data-tauri-drag-region opted
+              out so click-and-drag still picks up the parent (only
+              the avatar pixels are draggable in overlay mode). */}
+          {prefs.bgImageUrl && !IS_OVERLAY && !prefs.transparent && (
+            <img
+              src={prefs.bgImageUrl}
+              alt=""
+              style={{
+                position: 'absolute',
+                inset: 0,
+                width: '100%',
+                height: '100%',
+                objectFit: prefs.bgImageFit,
+                opacity: prefs.bgImageOpacity,
+                pointerEvents: 'none',
+                userSelect: 'none',
+              }}
+            />
+          )}
           {modelInfo ? (
             <Live2DViewer
               ref={viewerRef}
@@ -575,10 +633,19 @@ export default function Avatar() {
               defaultExpression={modelInfo.defaultExpression}
               lipSyncData={lipSyncData}
               isPlaying={isPlaying}
-              onActionsReady={setModelActions}
+              onActionsReady={(a) => {
+                setModelActions(a);
+                modelMotionsRef.current = a.motions;
+              }}
               scaleMultiplier={prefs.scaleMultiplier}
               offsetX={prefs.offsetX}
               offsetY={prefs.offsetY}
+              rotation={prefs.rotation}
+              mirrorX={prefs.mirrorX}
+              idleMotion={prefs.idleMotion}
+              idleMotionIntervalMs={prefs.idleMotionSecs * 1000}
+              eyeTracking={prefs.eyeTracking}
+              motionsRef={modelMotionsRef}
             />
           ) : (
             <div
@@ -644,7 +711,9 @@ export default function Avatar() {
               {subtitle}
             </div>
           )}
-          {/* Floating top-right settings/toggle row */}
+          {/* Floating top-right settings/toggle row.
+              In overlay (pet) mode this fades in only on hover so the
+              desktop pet looks like just an avatar by default. */}
           <div
             style={{
               position: 'absolute',
@@ -652,7 +721,13 @@ export default function Avatar() {
               right: 12,
               display: 'flex',
               gap: 6,
+              opacity: IS_OVERLAY ? (overlayHover ? 1 : 0) : 1,
+              transition: 'opacity 200ms ease',
+              pointerEvents: IS_OVERLAY && !overlayHover ? 'none' : 'auto',
             }}
+            // Buttons sit on top of the parent's drag region; opting
+            // out so clicks don't accidentally start a window drag.
+            {...{ 'data-tauri-drag-region': 'false' } as Record<string, string>}
           >
             <CanvasButton
               title="Canvas settings"
@@ -668,6 +743,26 @@ export default function Avatar() {
             >
               {prefs.showControls ? '✕' : '☰'}
             </CanvasButton>
+            {IS_OVERLAY && (
+              <CanvasButton
+                title="Hide desktop pet"
+                onClick={() => {
+                  // Tell the main window's PET_VISIBLE_KEY listener
+                  // (App.tsx Nav) to flip OFF, then call hide_avatar_window.
+                  try {
+                    localStorage.setItem('companion.petVisible.v1', '0');
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const inv = ((window as any).__TAURI_INTERNALS__?.invoke
+                      ?? (window as any).__TAURI__?.invoke) as
+                      | ((cmd: string) => Promise<unknown>)
+                      | undefined;
+                    inv?.('hide_avatar_window');
+                  } catch { /* non-fatal */ }
+                }}
+              >
+                ✕
+              </CanvasButton>
+            )}
           </div>
           {showSettings && (
             <CanvasSettingsPopover
@@ -830,12 +925,14 @@ export default function Avatar() {
       {/* Compact chat bar — only in overlay (desktop pet) mode. The
           overlay window is transparent + frameless, so this is the
           ONLY way to talk to Asuna without opening the main window.
-          Anchored to the bottom edge with a translucent backdrop so
-          the avatar above stays the visual focus. Stops drag bubbling
-          to the parent's drag region. */}
+          Hidden by default so the pet looks like just an avatar
+          floating on the desktop; fades in when the user hovers over
+          the canvas. Anchored to the bottom edge with a translucent
+          backdrop so the avatar above stays the visual focus. */}
       {IS_OVERLAY && (
         <form
           onMouseDown={(e) => e.stopPropagation()}
+          onMouseEnter={() => setOverlayHover(true)}
           onSubmit={(e) => {
             e.preventDefault();
             handleSendChat();
@@ -853,8 +950,10 @@ export default function Avatar() {
             padding: 8,
             borderRadius: 12,
             border: '1px solid #2a2d33',
-            // The form itself isn't draggable so the user can click
-            // into the input without picking up the window.
+            opacity: overlayHover || sending || chatInput.length > 0 ? 1 : 0,
+            transition: 'opacity 200ms ease',
+            pointerEvents:
+              overlayHover || sending || chatInput.length > 0 ? 'auto' : 'none',
           }}
           // Explicitly opt this subtree out of the parent's
           // data-tauri-drag-region so input clicks don't move the window.
@@ -1063,11 +1162,16 @@ function CanvasSettingsPopover({
   const palette = ['#0a0a0a', '#1f1f23', '#1a1f2e', '#2a1a1a', '#1a2a1a', '#ffffff'];
   return (
     <div
+      // The popover sits over the canvas; opt out of the parent's
+      // drag region so settings clicks don't pick up the window.
+      {...{ 'data-tauri-drag-region': 'false' } as Record<string, string>}
       style={{
         position: 'absolute',
         top: 52,
         right: 12,
-        width: 240,
+        width: 280,
+        maxHeight: 'calc(100% - 64px)',
+        overflowY: 'auto',
         background: '#16181c',
         border: '1px solid #2a2d33',
         borderRadius: 10,
@@ -1165,10 +1269,17 @@ function CanvasSettingsPopover({
 
       <div style={{ borderTop: '1px solid #2a2d33', paddingTop: 10 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-          <span style={{ fontSize: 12, color: '#aaa' }}>Model</span>
+          <span style={{ fontSize: 12, color: '#aaa' }}>Model transform</span>
           <button
             type="button"
-            onClick={() => onChange({ ...prefs, scaleMultiplier: 1, offsetX: 0, offsetY: 0 })}
+            onClick={() => onChange({
+              ...prefs,
+              scaleMultiplier: 1,
+              offsetX: 0,
+              offsetY: 0,
+              rotation: 0,
+              mirrorX: false,
+            })}
             style={{
               background: 'transparent',
               color: '#888',
@@ -1203,6 +1314,122 @@ function CanvasSettingsPopover({
           fmt={(v) => `${Math.round(v)}px`}
           onChange={(v) => onChange({ ...prefs, offsetY: v })}
         />
+        <SliderRow
+          label="Rotation"
+          value={prefs.rotation}
+          min={-180} max={180} step={1}
+          fmt={(v) => `${Math.round(v)}°`}
+          onChange={(v) => onChange({ ...prefs, rotation: v })}
+        />
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#aaa', cursor: 'pointer', marginTop: 6 }}>
+          <input
+            type="checkbox"
+            checked={prefs.mirrorX}
+            onChange={(e) => onChange({ ...prefs, mirrorX: e.target.checked })}
+          />
+          Mirror horizontally
+        </label>
+      </div>
+
+      {/* Background image (overrides solid color when set) */}
+      <div style={{ borderTop: '1px solid #2a2d33', paddingTop: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+          <span style={{ fontSize: 12, color: '#aaa' }}>Background image</span>
+          {prefs.bgImageUrl && (
+            <button
+              type="button"
+              onClick={() => onChange({ ...prefs, bgImageUrl: null })}
+              style={{
+                background: 'transparent',
+                color: '#888',
+                border: '1px solid #2a2d33',
+                borderRadius: 4,
+                padding: '2px 8px',
+                fontSize: 11,
+                cursor: 'pointer',
+              }}
+            >
+              Clear
+            </button>
+          )}
+        </div>
+        <input
+          type="file"
+          accept="image/*"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (!f) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+              if (typeof reader.result === 'string') {
+                onChange({ ...prefs, bgImageUrl: reader.result });
+              }
+            };
+            reader.readAsDataURL(f);
+          }}
+          style={{ fontSize: 11, color: '#aaa' }}
+        />
+        {prefs.bgImageUrl && (
+          <>
+            <SliderRow
+              label="Opacity"
+              value={prefs.bgImageOpacity}
+              min={0} max={1} step={0.05}
+              fmt={(v) => `${Math.round(v * 100)}%`}
+              onChange={(v) => onChange({ ...prefs, bgImageOpacity: v })}
+            />
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#aaa', marginTop: 4 }}>
+              <span style={{ minWidth: 70 }}>Fit</span>
+              <select
+                value={prefs.bgImageFit}
+                onChange={(e) => onChange({ ...prefs, bgImageFit: e.target.value as CanvasPrefs['bgImageFit'] })}
+                style={{
+                  flex: 1,
+                  background: '#0b0d10',
+                  color: '#fff',
+                  padding: '4px 6px',
+                  borderRadius: 4,
+                  border: '1px solid #2a2d33',
+                  fontSize: 11,
+                }}
+              >
+                <option value="cover">Cover (crop to fill)</option>
+                <option value="contain">Contain (fit, may letterbox)</option>
+                <option value="fill">Fill (stretch to fit)</option>
+              </select>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Behavior — idle motion + eye tracking */}
+      <div style={{ borderTop: '1px solid #2a2d33', paddingTop: 10 }}>
+        <div style={{ fontSize: 12, color: '#aaa', marginBottom: 6 }}>Behavior</div>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#aaa', cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={prefs.idleMotion}
+            onChange={(e) => onChange({ ...prefs, idleMotion: e.target.checked })}
+          />
+          Auto-play idle motion
+        </label>
+        {prefs.idleMotion && (
+          <SliderRow
+            label="Interval"
+            value={prefs.idleMotionSecs}
+            min={3} max={60} step={1}
+            fmt={(v) => `${Math.round(v)}s`}
+            onChange={(v) => onChange({ ...prefs, idleMotionSecs: v })}
+          />
+        )}
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#aaa', cursor: 'pointer', marginTop: 6 }}>
+          <input
+            type="checkbox"
+            checked={prefs.eyeTracking}
+            onChange={(e) => onChange({ ...prefs, eyeTracking: e.target.checked })}
+          />
+          Gaze follows cursor
+        </label>
       </div>
     </div>
   );
