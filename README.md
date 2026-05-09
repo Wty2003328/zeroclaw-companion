@@ -1,19 +1,35 @@
 # zeroclaw-companion
 
-A **Live2D anime companion + Pulse dashboard** for the
-[zeroclaw](https://github.com/zeroclaw-labs/zeroclaw) AI agent.
-Runs as an out-of-tree sidecar — zero patches to zeroclaw, talks
-over its public REST + SSE API.
+> A Live2D anime companion and information dashboard that gives the
+> [zeroclaw](https://github.com/zeroclaw-labs/zeroclaw) AI agent a
+> face, a voice, and a living workspace.
 
-Ships as either a **Tauri 2 desktop app** (recommended — gets you
-the always-on-top transparent desktop-pet window, native audio,
-hardware-accelerated Live2D rendering) or a **headless server +
-browser** combo.
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
+[![Tauri 2](https://img.shields.io/badge/tauri-2.x-brightgreen.svg)](https://tauri.app/)
 
-> **Why a separate repo?** Embedding these features in a fork of
-> zeroclaw made every upstream release a multi-day rebase. The
-> companion talks to vanilla zeroclaw — zero patches, no version
-> coupling.
+`zeroclaw-companion` is a desktop application that wraps the
+zeroclaw AI agent in a fully-featured user-facing experience:
+
+- A **Live2D avatar** that speaks every reply with your chosen
+  voice and lip-syncs to the audio. Cross-language: chat in English,
+  hear the avatar reply in Japanese (or any combination — the
+  built-in subagent handles per-paragraph translation).
+- A **desktop-pet mode** — a transparent, always-on-top, frameless
+  window you can drag, snap to a screen edge, and talk to without
+  ever opening the main app.
+- A **character roster** so different personas (each with its own
+  Live2D model and system prompt) are one click apart.
+- A **Pulse dashboard** for ambient information feeds (RSS, Hacker
+  News, anything you write a `Collector` for) backed by SQLite.
+- Full **Tauri 2 desktop application** packaging on Windows, macOS,
+  and Linux, with hardware-accelerated rendering and native audio
+  output.
+
+The companion is an **independent application** that talks to
+vanilla zeroclaw over its public REST + SSE API. Nothing in this
+repository modifies or forks zeroclaw — drop the companion next to
+any compatible zeroclaw install and it works.
 
 ## Features
 
