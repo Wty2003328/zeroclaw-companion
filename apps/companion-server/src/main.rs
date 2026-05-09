@@ -84,7 +84,8 @@ async fn main() -> Result<()> {
         .route(
             "/api/config/subagent",
             axum::routing::post(handle_post_subagent_override),
-        );
+        )
+        .route("/api/models", get(handle_list_models));
 
     if app_state.avatar.is_some() {
         let avatar_state = Arc::clone(app_state.avatar.as_ref().unwrap());
@@ -420,6 +421,68 @@ async fn handle_get_config(
         "avatar": avatar,
         "zeroclaw_url": state.zeroclaw.health().await.ok().map(|_| "ok"),
     }))
+}
+
+/// List Live2D models installed under `<web_dist_dir>/live2d/models/`.
+/// Each subdirectory is a model; we look for an entry-point JSON
+/// (Cubism 4 `*.model3.json` first, then Cubism 2 `*.model.json` or
+/// `model*.json`) to construct the URL the frontend can load.
+async fn handle_list_models(
+    _state: axum::extract::State<AppState>,
+) -> axum::Json<serde_json::Value> {
+    // Look in the same directory the static-file server uses. When
+    // launched from the workspace root via the wrapper, that's
+    // `./web/dist/live2d/models/`. We don't store the resolved path
+    // in AppState yet, so we re-derive it from cwd here — safe because
+    // companion-server (sidecar or standalone) is always launched
+    // from a known-cwd ancestor.
+    let dist = std::env::current_dir()
+        .map(|cwd| cwd.join("web").join("dist"))
+        .unwrap_or_default();
+    let models_dir = dist.join("live2d").join("models");
+
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&models_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let dir_name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            if dir_name.is_empty() {
+                continue;
+            }
+            // Prefer Cubism 4 entry, then Cubism 2 conventions.
+            let mut entry_file: Option<String> = None;
+            let mut format = "cubism2";
+            if let Ok(files) = std::fs::read_dir(&p) {
+                let mut all: Vec<String> = files
+                    .flatten()
+                    .filter_map(|f| f.file_name().to_str().map(|s| s.to_string()))
+                    .collect();
+                all.sort();
+                if let Some(f) = all.iter().find(|s| s.ends_with(".model3.json")) {
+                    entry_file = Some(f.clone());
+                    format = "cubism4";
+                } else if let Some(f) = all
+                    .iter()
+                    .find(|s| s.ends_with(".model.json") || s.starts_with("model"))
+                {
+                    entry_file = Some(f.clone());
+                }
+            }
+            if let Some(f) = entry_file {
+                let url = format!("/live2d/models/{dir_name}/{f}");
+                out.push(serde_json::json!({
+                    "id": dir_name,
+                    "name": dir_name,
+                    "modelUrl": url,
+                    "format": format,
+                }));
+            }
+        }
+    }
+    axum::Json(serde_json::json!({ "models": out }))
 }
 
 #[derive(serde::Deserialize)]

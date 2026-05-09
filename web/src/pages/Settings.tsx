@@ -6,6 +6,12 @@ import {
   getStoredServerUrl,
   setStoredServerUrl,
 } from '../lib/apiBase';
+import {
+  fetchInstalledModels,
+  getUserModelChoice,
+  setUserModelChoice,
+  type InstalledModel,
+} from '../lib/models';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function tauriInvoke(): ((cmd: string, args?: Record<string, unknown>) => Promise<any>) | null {
@@ -155,6 +161,11 @@ export default function Settings() {
             <ReadonlyRow label="default expression" value={cfg.avatar.model.default_expression} />
           </>
         )}
+      </Section>
+
+      {/* ── Live2D model picker ────────────────────────────────── */}
+      <Section title="Live2D model">
+        <ModelPicker />
       </Section>
 
       {/* ── Subagent (translation + expression LLM) ────────────── */}
@@ -388,6 +399,99 @@ function FieldRow({ label, children }: { label: string; children: React.ReactNod
       <span style={{ minWidth: 160, color: '#888', fontSize: 12 }}>{label}</span>
       <div style={{ flex: '1 1 280px', minWidth: 220 }}>{children}</div>
     </div>
+  );
+}
+
+// ── Model picker ─────────────────────────────────────────────────
+//
+// Lists models installed under web/public/live2d/models/ via the
+// /api/models endpoint and lets the user pick one. Selection is
+// persisted to localStorage; Avatar.tsx listens for the
+// `companion:userModel` custom event and live-updates the canvas.
+function ModelPicker() {
+  const [models, setModels] = useState<InstalledModel[]>([]);
+  const [picked, setPicked] = useState<string | null>(() => getUserModelChoice());
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchInstalledModels()
+      .then((m) => {
+        if (cancelled) return;
+        if (m.length === 0) {
+          setError('No models found under web/public/live2d/models/');
+        }
+        setModels(m);
+      })
+      .catch((e) => !cancelled && setError(String(e)));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const choose = (id: string | null) => {
+    setPicked(id);
+    setUserModelChoice(id);
+    // Notify same-window listeners (storage event only fires
+    // cross-tab, not within the same window where the write happened).
+    window.dispatchEvent(new Event('companion:userModel'));
+  };
+
+  if (error) return <Hint tone="warn">{error}</Hint>;
+  if (models.length === 0) return <Hint tone="muted">loading installed models…</Hint>;
+
+  return (
+    <>
+      <div style={{ color: '#888', fontSize: 12, marginBottom: 8, lineHeight: 1.5 }}>
+        Pick which Live2D model the avatar canvas renders. Drop new
+        models into <code style={{ color: '#aaa' }}>web/public/live2d/models/&lt;name&gt;/</code>
+        — they'll appear here after a refresh.
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <ModelChoice
+          label="Server default"
+          format=""
+          checked={picked === null}
+          onChange={() => choose(null)}
+        />
+        {models.map((m) => (
+          <ModelChoice
+            key={m.id}
+            label={m.name}
+            format={m.format}
+            checked={picked === m.id}
+            onChange={() => choose(m.id)}
+          />
+        ))}
+      </div>
+      <Hint tone="muted">
+        {picked
+          ? `Active: ${picked} (override). Clears on "Server default".`
+          : `Active: server-default (companion.toml \`[avatar.model]\`).`}
+      </Hint>
+    </>
+  );
+}
+
+function ModelChoice({
+  label,
+  format,
+  checked,
+  onChange,
+}: {
+  label: string;
+  format: string;
+  checked: boolean;
+  onChange: () => void;
+}) {
+  return (
+    <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13 }}>
+      <input type="radio" name="live2d-model" checked={checked} onChange={onChange} />
+      <span style={{ color: checked ? '#10b981' : '#cbd5e1' }}>{label}</span>
+      {format && (
+        <span style={{ color: '#666', fontSize: 11 }}>({format})</span>
+      )}
+    </label>
   );
 }
 

@@ -16,6 +16,11 @@ import {
   savePetPosition,
   computeSnap,
 } from '../lib/petWindow';
+import {
+  fetchInstalledModels,
+  getUserModelChoice,
+  type InstalledModel,
+} from '../lib/models';
 
 interface ModelInfo {
   modelUrl: string;
@@ -240,6 +245,36 @@ export default function Avatar() {
   // corner buttons — the avatar floats chromeless on the desktop and
   // the controls fade in only on demand. No effect in main window.
   const [overlayHover, setOverlayHover] = useState(false);
+
+  // User-selected Live2D model (overrides the server's WS ModelInfo).
+  // Settings page writes localStorage; we listen for storage events
+  // to react in real time + on the same window via custom events.
+  const [installedModels, setInstalledModels] = useState<InstalledModel[]>([]);
+  const [userModelId, setUserModelId] = useState<string | null>(() => getUserModelChoice());
+  useEffect(() => {
+    void fetchInstalledModels().then(setInstalledModels);
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'companion.userModel.v1') {
+        setUserModelId(getUserModelChoice());
+      }
+    };
+    const onCustom = () => setUserModelId(getUserModelChoice());
+    window.addEventListener('storage', onStorage);
+    window.addEventListener('companion:userModel', onCustom);
+    return () => {
+      window.removeEventListener('storage', onStorage);
+      window.removeEventListener('companion:userModel', onCustom);
+    };
+  }, []);
+  // Effective model: user's pick from installedModels (if found),
+  // otherwise the server's default that arrives via WS ModelInfo.
+  const effectiveModelInfo: ModelInfo | null = (() => {
+    if (!modelInfo) return null;
+    if (!userModelId) return modelInfo;
+    const picked = installedModels.find((m) => m.id === userModelId);
+    if (!picked) return modelInfo;
+    return { ...modelInfo, modelUrl: picked.modelUrl };
+  })();
 
   // Pet window placement: restore on mount + persist + snap-to-edge.
   //
@@ -706,13 +741,13 @@ export default function Avatar() {
               }}
             />
           )}
-          {modelInfo ? (
+          {effectiveModelInfo ? (
             <Live2DViewer
               ref={viewerRef}
-              modelUrl={modelInfo.modelUrl}
-              scale={modelInfo.scale}
-              anchor={modelInfo.anchor}
-              defaultExpression={modelInfo.defaultExpression}
+              modelUrl={effectiveModelInfo.modelUrl}
+              scale={effectiveModelInfo.scale}
+              anchor={effectiveModelInfo.anchor}
+              defaultExpression={effectiveModelInfo.defaultExpression}
               lipSyncData={lipSyncData}
               isPlaying={isPlaying}
               onActionsReady={(a) => {
