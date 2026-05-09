@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import {
   HTTP_BASE,
   getDefaultServerUrl,
@@ -7,6 +7,7 @@ import {
   setStoredServerUrl,
 } from '../lib/apiBase';
 import { invalidateCache, useCachedJson } from '../lib/fetchCache';
+import { pickFile, pickFolder, listGpus, type DetectedGpu } from '../lib/tauriShell';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function tauriInvoke(): ((cmd: string, args?: Record<string, unknown>) => Promise<any>) | null {
@@ -26,6 +27,12 @@ interface AvatarConfigView {
     voice: string | null;
     api_url: string | null;
     speed: number;
+    launch_command: string | null;
+    reference_audio: string | null;
+    reference_text: string | null;
+    reference_language: string | null;
+    model_path: string | null;
+    gpu_device: number;
   };
   subagent: {
     enabled: boolean;
@@ -87,7 +94,11 @@ export default function Settings() {
   const isUsingDefaultUrl = !getStoredServerUrl();
 
   return (
-    <div style={{ flex: '1 1 0', minHeight: 0, overflow: 'auto' }}>
+    <div style={{
+      flex: '1 1 0', minHeight: 0, overflow: 'auto',
+      contain: 'paint',
+      overscrollBehavior: 'contain',
+    }}>
       <div style={{ padding: 32, maxWidth: 880, margin: '0 auto' }}>
       <h1 style={{ marginTop: 0, fontSize: 24 }}>Settings</h1>
       <p style={{ color: '#888', fontSize: 13, marginTop: -4 }}>
@@ -167,18 +178,162 @@ const LANGUAGE_CHOICES: { code: string; label: string }[] = [
   { code: 'de', label: 'German (de)' },
 ];
 
-// Known TTS engines. `gpt-sovits-v4` is the project's default reference
-// rig; the others are common alternatives users may have set up.
-// "Custom…" lets the user type whatever (no validation server-side).
-const TTS_ENGINES: { value: string; label: string }[] = [
-  { value: 'gpt-sovits-v4', label: 'gpt-sovits-v4' },
-  { value: 'gpt-sovits',    label: 'gpt-sovits (legacy)' },
-  { value: 'edge-tts',      label: 'edge-tts (Microsoft, no GPU)' },
-  { value: 'fish-speech',   label: 'fish-speech' },
-  { value: 'melotts',       label: 'melotts' },
-  { value: 'xtts',          label: 'xtts' },
-  { value: 'f5-tts',        label: 'f5-tts' },
+/** Per-engine spec: which fields the form should expose, plus a
+ *  one-liner describing what the engine is. Custom engine names get
+ *  the "show everything" fallback below — power users typically know
+ *  what they need.
+ *
+ *  Removed: legacy `gpt-sovits` (v1-v3). It still works if a user has
+ *  it set in companion.toml — they'll just see the Custom path and
+ *  can edit by hand. v4 is the supported zero-shot rig. */
+interface EngineSpec {
+  value: string;
+  label: string;
+  description: string;
+  needsLauncher: boolean;
+  needsModelRoot: boolean;
+  modelRootLabel?: string;
+  modelRootHint?: string;
+  needsGpu: boolean;
+  needsVoiceSample: boolean;
+  needsPresetVoice: boolean;
+  presetVoices?: { value: string; label: string }[];
+}
+
+const ENGINE_SPECS: EngineSpec[] = [
+  {
+    value: 'gpt-sovits-v4',
+    label: 'GPT-SoVITS v4',
+    description: 'High-quality zero-shot voice cloning. Needs GPU + a 3-10s voice sample.',
+    needsLauncher: true,
+    needsModelRoot: true,
+    modelRootLabel: 'GPT-SoVITS install folder',
+    modelRootHint: 'Path to your GPT-SoVITS git checkout (the folder with `tools/`, `GPT_SoVITS/`, etc.)',
+    needsGpu: true,
+    needsVoiceSample: true,
+    needsPresetVoice: false,
+  },
+  {
+    value: 'fish-speech',
+    label: 'fish-speech',
+    description: 'Zero-shot voice cloning. Needs GPU + a voice sample.',
+    needsLauncher: true,
+    needsModelRoot: true,
+    modelRootLabel: 'fish-speech model folder',
+    modelRootHint: 'Path to the fish-speech checkpoint directory',
+    needsGpu: true,
+    needsVoiceSample: true,
+    needsPresetVoice: false,
+  },
+  {
+    value: 'xtts',
+    label: 'XTTS (Coqui)',
+    description: 'Zero-shot multilingual cloning. Needs GPU + a voice sample.',
+    needsLauncher: true,
+    needsModelRoot: true,
+    modelRootLabel: 'XTTS model folder',
+    modelRootHint: 'Path to the Coqui XTTS model directory',
+    needsGpu: true,
+    needsVoiceSample: true,
+    needsPresetVoice: false,
+  },
+  {
+    value: 'f5-tts',
+    label: 'F5-TTS',
+    description: 'Fast zero-shot synthesis. Needs GPU + a voice sample.',
+    needsLauncher: true,
+    needsModelRoot: true,
+    modelRootLabel: 'F5-TTS install folder',
+    modelRootHint: 'Path to the F5-TTS checkout',
+    needsGpu: true,
+    needsVoiceSample: true,
+    needsPresetVoice: false,
+  },
+  {
+    value: 'edge-tts',
+    label: 'edge-tts (Microsoft, free, no GPU)',
+    description: 'Cloud-based preset voices from Microsoft Edge. Free, fast, no GPU. Pick from a fixed voice list.',
+    needsLauncher: true,
+    needsModelRoot: false,
+    needsGpu: false,
+    needsVoiceSample: false,
+    needsPresetVoice: true,
+    presetVoices: [
+      { value: 'ja-JP-NanamiNeural', label: 'ja-JP / Nanami (female)' },
+      { value: 'ja-JP-KeitaNeural',  label: 'ja-JP / Keita (male)' },
+      { value: 'en-US-AriaNeural',   label: 'en-US / Aria (female)' },
+      { value: 'en-US-GuyNeural',    label: 'en-US / Guy (male)' },
+      { value: 'en-US-JennyNeural',  label: 'en-US / Jenny (female)' },
+      { value: 'zh-CN-XiaoxiaoNeural', label: 'zh-CN / Xiaoxiao (female)' },
+      { value: 'zh-CN-YunxiNeural',  label: 'zh-CN / Yunxi (male)' },
+      { value: 'ko-KR-SunHiNeural',  label: 'ko-KR / SunHi (female)' },
+    ],
+  },
+  {
+    value: 'melotts',
+    label: 'MeloTTS',
+    description: 'Lightweight multilingual TTS with preset voices. Runs on CPU or GPU.',
+    needsLauncher: true,
+    needsModelRoot: false,
+    needsGpu: true,
+    needsVoiceSample: false,
+    needsPresetVoice: true,
+    presetVoices: [
+      { value: 'JP',     label: 'Japanese (default)' },
+      { value: 'EN-US',  label: 'English US' },
+      { value: 'EN-BR',  label: 'English UK' },
+      { value: 'ZH',     label: 'Chinese' },
+      { value: 'KR',     label: 'Korean' },
+      { value: 'FR',     label: 'French' },
+      { value: 'ES',     label: 'Spanish' },
+    ],
+  },
 ];
+
+/** "Show everything" spec for custom/unknown engines. */
+const CUSTOM_ENGINE_SPEC: EngineSpec = {
+  value: '__custom',
+  label: 'Custom engine',
+  description: "You're bringing your own. We expose every field — pick what your wrapper needs.",
+  needsLauncher: true,
+  needsModelRoot: true,
+  modelRootLabel: 'Engine root folder',
+  modelRootHint: 'Whatever your wrapper expects as TTS_MODEL_PATH',
+  needsGpu: true,
+  needsVoiceSample: true,
+  needsPresetVoice: false,
+};
+
+function engineSpec(engine: string): EngineSpec {
+  return ENGINE_SPECS.find((e) => e.value === engine) ?? CUSTOM_ENGINE_SPEC;
+}
+
+/** Split a launch_command into (python interpreter, server script).
+ *  The combined form looks like `C:/path/python.exe tools/x.py`.
+ *  Heuristic:
+ *    1. Match on `.exe`/`python`/`python3` followed by whitespace —
+ *       this handles paths-with-no-spaces cleanly.
+ *    2. Otherwise split on the first whitespace.
+ *    3. If neither, treat the whole thing as the interpreter.
+ *  Doesn't handle Windows paths with embedded spaces — for those the
+ *  user can paste the combined string into either field; we re-join
+ *  on save with a single space. */
+function splitLaunch(combined: string): { python: string; script: string } {
+  const trimmed = combined.trim();
+  if (!trimmed) return { python: '', script: '' };
+  const m = trimmed.match(/^(.*?(?:\.exe|python\d?))\s+(.+)$/i);
+  if (m) return { python: m[1].trim(), script: m[2].trim() };
+  const ws = trimmed.indexOf(' ');
+  if (ws < 0) return { python: trimmed, script: '' };
+  return { python: trimmed.slice(0, ws), script: trimmed.slice(ws + 1).trim() };
+}
+
+function joinLaunch(python: string, script: string): string {
+  const p = python.trim();
+  const s = script.trim();
+  if (p && s) return `${p} ${s}`;
+  return p || s;
+}
 
 function AvatarEditor({
   current, onSaved,
@@ -191,6 +346,29 @@ function AvatarEditor({
   const [ttsLang, setTtsLang] = useState<string>(current.tts.language);
   const [ttsSpeed, setTtsSpeed] = useState<number>(current.tts.speed);
   const [ttsEngine, setTtsEngine] = useState<string>(current.tts.engine);
+  // TTS path / reference settings — used to require editing
+  // companion.toml. Now editable here so a fresh install can be set
+  // up without leaving the app.
+  // Split the combined launch_command (`python.exe tools/x.py`) into
+  // two fields so the user gets a clean "interpreter + script" UI
+  // instead of one merged string that couldn't be properly browsed.
+  const initialLaunch = splitLaunch(current.tts.launch_command ?? '');
+  const [ttsPython, setTtsPython] = useState<string>(initialLaunch.python);
+  const [ttsScript, setTtsScript] = useState<string>(initialLaunch.script);
+  const ttsLaunchCmd = joinLaunch(ttsPython, ttsScript);
+  const [ttsRefAudio, setTtsRefAudio] = useState<string>(current.tts.reference_audio ?? '');
+  const [ttsRefText, setTtsRefText] = useState<string>(current.tts.reference_text ?? '');
+  const [ttsRefLang, setTtsRefLang] = useState<string>(current.tts.reference_language ?? '');
+  const [ttsModelPath, setTtsModelPath] = useState<string>(current.tts.model_path ?? '');
+  const [ttsGpu, setTtsGpu] = useState<number>(current.tts.gpu_device);
+  const [ttsVoice, setTtsVoice] = useState<string>(current.tts.voice ?? '');
+  // Detected GPUs from the host (nvidia-smi → WMI fallback).
+  // Empty until the Tauri command resolves; we render a sane fallback
+  // (CPU + "GPU 0") until then.
+  const [detectedGpus, setDetectedGpus] = useState<DetectedGpu[]>([]);
+  useEffect(() => { void listGpus().then(setDetectedGpus); }, []);
+  const spec = engineSpec(ttsEngine);
+  const isCustomEngine = !ENGINE_SPECS.find((e) => e.value === ttsEngine);
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -200,7 +378,14 @@ function AvatarEditor({
     chatLang !== current.chat_language ||
     ttsLang !== current.tts.language ||
     Math.abs(ttsSpeed - current.tts.speed) > 0.001 ||
-    ttsEngine.trim() !== current.tts.engine;
+    ttsEngine.trim() !== current.tts.engine ||
+    ttsLaunchCmd.trim() !== (current.tts.launch_command ?? '') ||
+    ttsRefAudio.trim() !== (current.tts.reference_audio ?? '') ||
+    ttsRefText.trim() !== (current.tts.reference_text ?? '') ||
+    ttsRefLang.trim() !== (current.tts.reference_language ?? '') ||
+    ttsModelPath.trim() !== (current.tts.model_path ?? '') ||
+    ttsGpu !== current.tts.gpu_device ||
+    ttsVoice.trim() !== (current.tts.voice ?? '');
 
   const save = async () => {
     setSaving(true); setError(null);
@@ -210,6 +395,13 @@ function AvatarEditor({
     if (ttsLang !== current.tts.language) body.tts_language = ttsLang;
     if (Math.abs(ttsSpeed - current.tts.speed) > 0.001) body.tts_speed = ttsSpeed;
     if (ttsEngine.trim() !== current.tts.engine) body.tts_engine = ttsEngine.trim();
+    if (ttsLaunchCmd.trim() !== (current.tts.launch_command ?? '')) body.tts_launch_command = ttsLaunchCmd.trim();
+    if (ttsRefAudio.trim() !== (current.tts.reference_audio ?? '')) body.tts_reference_audio = ttsRefAudio.trim();
+    if (ttsRefText.trim() !== (current.tts.reference_text ?? '')) body.tts_reference_text = ttsRefText.trim();
+    if (ttsRefLang.trim() !== (current.tts.reference_language ?? '')) body.tts_reference_language = ttsRefLang.trim();
+    if (ttsModelPath.trim() !== (current.tts.model_path ?? '')) body.tts_model_path = ttsModelPath.trim();
+    if (ttsGpu !== current.tts.gpu_device) body.tts_gpu_device = ttsGpu;
+    if (ttsVoice.trim() !== (current.tts.voice ?? '')) body.tts_voice = ttsVoice.trim();
     try {
       const r = await fetch(`${HTTP_BASE}/api/config/avatar`, {
         method: 'POST',
@@ -275,20 +467,23 @@ function AvatarEditor({
       <AdvancedDisclosure label="Advanced — voice engine">
         <FieldRow label="Voice engine">
           <select
-            value={TTS_ENGINES.find((e) => e.value === ttsEngine) ? ttsEngine : '__custom'}
+            value={isCustomEngine ? '__custom' : ttsEngine}
             onChange={(e) => {
               if (e.target.value === '__custom') return;
               setTtsEngine(e.target.value);
             }}
             style={inputStyle}
           >
-            {TTS_ENGINES.map((e) => (
+            {ENGINE_SPECS.map((e) => (
               <option key={e.value} value={e.value}>{e.label}</option>
             ))}
             <option value="__custom">Other…</option>
           </select>
         </FieldRow>
-        {!TTS_ENGINES.find((e) => e.value === ttsEngine) && (
+        <div style={{ fontSize: 11, color: '#666', marginLeft: 168, marginTop: -4, marginBottom: 10, lineHeight: 1.5 }}>
+          {spec.description}
+        </div>
+        {isCustomEngine && (
           <FieldRow label="Custom engine name">
             <input
               type="text"
@@ -299,21 +494,216 @@ function AvatarEditor({
             />
           </FieldRow>
         )}
+
+        {spec.needsLauncher && (
+          <>
+            <FieldRow label="Python interpreter">
+              <PathPicker
+                value={ttsPython}
+                onChange={setTtsPython}
+                placeholder="C:/Users/.../envs/<env>/python.exe"
+                pick={async () => {
+                  const path = await pickFile({
+                    title: 'Pick the Python interpreter (python.exe)',
+                    filters: [
+                      { label: 'Python executable', extensions: ['exe'] },
+                      { label: 'All files', extensions: ['*'] },
+                    ],
+                  });
+                  if (path) setTtsPython(path);
+                }}
+              />
+            </FieldRow>
+            <FieldRow label="Server script">
+              <PathPicker
+                value={ttsScript}
+                onChange={setTtsScript}
+                placeholder="tools/avatar/asuna_tts_server.py"
+                pick={async () => {
+                  const path = await pickFile({
+                    title: 'Pick the TTS server script',
+                    filters: [
+                      { label: 'Python script', extensions: ['py'] },
+                      { label: 'All files', extensions: ['*'] },
+                    ],
+                  });
+                  if (path) setTtsScript(path);
+                }}
+              />
+            </FieldRow>
+            <div style={{ fontSize: 11, color: '#666', marginLeft: 168, marginTop: -4, marginBottom: 8, lineHeight: 1.5 }}>
+              The Python the engine runs under and the wrapper script that
+              serves <code style={{ color: '#888' }}>/tts</code>. The script
+              can be either an absolute path or relative to the workspace
+              root (where companion-server is launched from).
+            </div>
+          </>
+        )}
+
+        {spec.needsModelRoot && (
+          <>
+            <FieldRow label={spec.modelRootLabel ?? 'Engine model folder'}>
+              <PathPicker
+                value={ttsModelPath}
+                onChange={setTtsModelPath}
+                placeholder={spec.modelRootHint ?? 'C:/path/to/engine'}
+                pick={async () => {
+                  const path = await pickFolder({ title: `Pick the ${spec.modelRootLabel ?? 'engine'} folder` });
+                  if (path) setTtsModelPath(path);
+                }}
+                buttonLabel="Browse folder"
+              />
+            </FieldRow>
+            {spec.modelRootHint && (
+              <div style={{ fontSize: 11, color: '#666', marginLeft: 168, marginTop: -4, marginBottom: 8, lineHeight: 1.5 }}>
+                {spec.modelRootHint}
+              </div>
+            )}
+          </>
+        )}
+
+        {spec.needsPresetVoice && (
+          <FieldRow label="Voice">
+            <select
+              value={spec.presetVoices?.find((v) => v.value === ttsVoice) ? ttsVoice : '__custom'}
+              onChange={(e) => {
+                if (e.target.value === '__custom') return;
+                setTtsVoice(e.target.value);
+              }}
+              style={inputStyle}
+            >
+              {spec.presetVoices?.map((v) => (
+                <option key={v.value} value={v.value}>{v.label}</option>
+              ))}
+              <option value="__custom">Other…</option>
+            </select>
+          </FieldRow>
+        )}
+        {spec.needsPresetVoice && !spec.presetVoices?.find((v) => v.value === ttsVoice) && (
+          <FieldRow label="Custom voice id">
+            <input
+              type="text"
+              value={ttsVoice}
+              onChange={(e) => setTtsVoice(e.target.value)}
+              placeholder="e.g. ja-JP-SomeOtherNeural"
+              style={inputStyle}
+            />
+          </FieldRow>
+        )}
+
+        {spec.needsVoiceSample && (
+          <div style={{
+            marginTop: 8, paddingTop: 12, paddingBottom: 4,
+            borderTop: '1px solid #1f2227',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 8 }}>
+              <strong style={{ fontSize: 12, color: '#cbd5e1' }}>Voice sample</strong>
+              <span style={{ fontSize: 11, color: '#666' }}>
+                — short clip the engine uses as a prosody prompt on every line it speaks
+              </span>
+            </div>
+            <FieldRow label="Sample audio">
+              <PathPicker
+                value={ttsRefAudio}
+                onChange={setTtsRefAudio}
+                placeholder="C:/Users/.../0003.wav  (a 3-10s clip of the target voice)"
+                pick={async () => {
+                  const path = await pickFile({
+                    title: 'Pick a 3-10s voice sample clip',
+                    filters: [
+                      { label: 'Audio', extensions: ['wav', 'mp3', 'flac', 'ogg', 'm4a'] },
+                      { label: 'All files', extensions: ['*'] },
+                    ],
+                  });
+                  if (path) setTtsRefAudio(path);
+                }}
+              />
+            </FieldRow>
+            <FieldRow label="Sample transcript">
+              <input
+                type="text"
+                value={ttsRefText}
+                onChange={(e) => setTtsRefText(e.target.value)}
+                placeholder="Exact words spoken in the sample audio"
+                style={inputStyle}
+              />
+            </FieldRow>
+            <FieldRow label="Sample language">
+              <select
+                value={ttsRefLang}
+                onChange={(e) => setTtsRefLang(e.target.value)}
+                style={inputStyle}
+              >
+                <option value="">(use voice language)</option>
+                {LANGUAGE_CHOICES.map((l) => (
+                  <option key={l.code} value={l.code}>{l.label}</option>
+                ))}
+              </select>
+            </FieldRow>
+            <div style={{ fontSize: 11, color: '#666', marginLeft: 168, marginTop: 4, lineHeight: 1.5 }}>
+              Zero-shot voice cloning: the engine reads the sample on each
+              call to lock in timbre + speaking style. Pick a clean,
+              expressive 3-10 second clip in a single take. Different
+              samples give different reading styles from the same trained
+              voice — calm clip → calm narration, bright clip → upbeat.
+            </div>
+          </div>
+        )}
+        {spec.needsGpu && (
+          <>
+            <FieldRow label="GPU device">
+              <select
+                value={ttsGpu}
+                onChange={(e) => setTtsGpu(parseInt(e.target.value, 10))}
+                style={{ ...inputStyle, maxWidth: 480 }}
+              >
+                <option value={-1}>CPU only (slow)</option>
+                {detectedGpus.length > 0 ? (
+                  detectedGpus.map((g) => (
+                    <option key={g.index} value={g.index}>
+                      GPU {g.index}: {g.name}
+                      {g.vram_total_mb != null
+                        ? ` (${(g.vram_total_mb / 1024).toFixed(1)} GB)`
+                        : ''}
+                    </option>
+                  ))
+                ) : (
+                  // Fallback when detection failed — keep the form usable
+                  // and let advanced users still pick GPU 0 manually.
+                  <option value={0}>GPU 0 (auto-detect failed; pick manually)</option>
+                )}
+                {/* If user has saved an index outside the detected
+                    range (e.g. detection returned only GPU 0 but
+                    config saved GPU 2 from a previous setup), keep
+                    that value selectable so saving doesn't silently
+                    coerce. */}
+                {ttsGpu >= 0 && !detectedGpus.find((g) => g.index === ttsGpu) && detectedGpus.length > 0 && (
+                  <option value={ttsGpu}>GPU {ttsGpu} (saved; not detected on this machine)</option>
+                )}
+              </select>
+            </FieldRow>
+            <div style={{ fontSize: 11, color: '#666', marginLeft: 168, marginTop: -4, marginBottom: 8, lineHeight: 1.5 }}>
+              {detectedGpus.length === 0
+                ? 'GPU detection unavailable (nvidia-smi not on PATH). Pick GPU 0 if you have one CUDA card, or CPU.'
+                : `Detected ${detectedGpus.length} GPU${detectedGpus.length === 1 ? '' : 's'} on this machine.`}
+            </div>
+          </>
+        )}
         <div style={{ fontSize: 11, color: '#666', marginTop: 4, lineHeight: 1.5 }}>
-          Different engines need different model files and a matching
-          launcher. If you change this, you'll likely also need to point
-          the app at the right files in your config — see the README.
-          <br />
-          The avatar's voice, Live2D model, and default expression are
-          set per-character on the <a href="/" style={{ color: '#7aa9ff' }}>Home page</a>.
+          The avatar's Live2D model and default expression are set
+          per-character on the <a href="/" style={{ color: '#7aa9ff' }}>Home page</a>.
         </div>
       </AdvancedDisclosure>
 
       <Row>
         <div style={{ flex: 1, minWidth: 0 }}>
           {error && <Hint tone="warn">{error}</Hint>}
-          {savedAt && !error && <Hint tone="good">Saved. Click <strong>Restart</strong> to apply.</Hint>}
-          {!savedAt && !error && dirty && <Hint tone="muted">unsaved changes</Hint>}
+          {/* Order matters: a fresh dirty edit should switch from
+              "Saved" back to "unsaved changes". Without dirty taking
+              precedence, the green "Saved" hint stuck around forever
+              after the first save. */}
+          {!error && dirty && <Hint tone="muted">unsaved changes</Hint>}
+          {!error && !dirty && savedAt && <Hint tone="good">Saved. Click <strong>Restart</strong> to apply.</Hint>}
         </div>
         <Button onClick={save} primary disabled={!dirty || saving}>
           {saving ? 'saving…' : 'Save'}
@@ -506,8 +896,12 @@ function SubagentEditor({
       <Row>
         <div style={{ flex: 1, minWidth: 0 }}>
           {error && <Hint tone="warn">{error}</Hint>}
-          {savedAt && !error && <Hint tone="good">Saved. Click <strong>Restart</strong> to apply.</Hint>}
-          {!savedAt && !error && dirty && <Hint tone="muted">unsaved changes</Hint>}
+          {/* Order matters: a fresh dirty edit should switch from
+              "Saved" back to "unsaved changes". Without dirty taking
+              precedence, the green "Saved" hint stuck around forever
+              after the first save. */}
+          {!error && dirty && <Hint tone="muted">unsaved changes</Hint>}
+          {!error && !dirty && savedAt && <Hint tone="good">Saved. Click <strong>Restart</strong> to apply.</Hint>}
         </div>
         <Button onClick={save} primary disabled={!dirty || saving}>
           {saving ? 'saving…' : 'Save'}
@@ -545,6 +939,48 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean
         background: '#fff', transition: 'left 120ms ease',
       }} />
     </button>
+  );
+}
+
+/** Inline path field with a Browse button. Wraps the native file
+ *  picker so the user doesn't have to type or paste OS paths by hand. */
+function PathPicker({
+  value, onChange, placeholder, pick, buttonLabel,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  pick: () => Promise<void>;
+  buttonLabel?: string;
+}) {
+  const [picking, setPicking] = useState(false);
+  return (
+    <div style={{ display: 'flex', gap: 6, flex: 1, minWidth: 0 }}>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        style={{ ...inputStyle, flex: 1, minWidth: 0 }}
+      />
+      <button
+        type="button"
+        disabled={picking}
+        onClick={async () => {
+          setPicking(true);
+          try { await pick(); }
+          finally { setPicking(false); }
+        }}
+        style={{
+          padding: '8px 14px', background: 'transparent', color: '#888',
+          border: '1px solid #2a2d33', borderRadius: 6, fontSize: 13,
+          cursor: picking ? 'not-allowed' : 'pointer', opacity: picking ? 0.5 : 1,
+          flexShrink: 0,
+        }}
+      >
+        {picking ? '…' : (buttonLabel ?? 'Browse')}
+      </button>
+    </div>
   );
 }
 

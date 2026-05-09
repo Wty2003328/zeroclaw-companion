@@ -125,13 +125,36 @@ pub struct AvatarOverride {
     #[serde(default)]
     pub tts_speed: Option<f64>,
     /// TTS engine identifier (e.g. "gpt-sovits-v4", "edge-tts").
-    /// Note: changing this from the UI without also updating
-    /// avatar.tts.launch_command / reference_audio / model_path in
-    /// companion.toml will leave the system in an inconsistent state.
-    /// We surface a warning in the Settings UI that other knobs may
-    /// also need adjustment.
     #[serde(default)]
     pub tts_engine: Option<String>,
+    /// Full launch command for the TTS server process (e.g.
+    /// `"<conda>/python.exe tools/avatar/asuna_tts_server.py"`).
+    /// companion-server spawns this with `auto_start = true`.
+    #[serde(default)]
+    pub tts_launch_command: Option<String>,
+    /// Path to the reference audio clip GPT-SoVITS uses for zero-shot
+    /// voice cloning (e.g. a 3–10s sample of the target voice).
+    #[serde(default)]
+    pub tts_reference_audio: Option<String>,
+    /// Transcript of the reference audio clip (in `tts_reference_language`).
+    #[serde(default)]
+    pub tts_reference_text: Option<String>,
+    /// Language code of the reference clip (e.g. "ja", "en", "zh").
+    #[serde(default)]
+    pub tts_reference_language: Option<String>,
+    /// Filesystem path to the GPT-SoVITS install root (forwarded to
+    /// the wrapper as `TTS_MODEL_PATH`).
+    #[serde(default)]
+    pub tts_model_path: Option<String>,
+    /// CUDA device index for TTS inference. 0 = first GPU; -1 = CPU.
+    #[serde(default)]
+    pub tts_gpu_device: Option<i32>,
+    /// Voice identifier for preset-voice engines (e.g.
+    /// `"ja-JP-NanamiNeural"` for edge-tts, `"JP"` for melotts).
+    /// Ignored by zero-shot engines, which use the reference clip
+    /// for voice characteristics instead.
+    #[serde(default)]
+    pub tts_voice: Option<String>,
 }
 
 /// Subagent backend + LLM connection overrides. Anything `Some` replaces
@@ -177,8 +200,18 @@ impl RuntimeOverride {
             if let Some(ref v) = a.chat_language {
                 avatar_obj.insert("chat_language".into(), serde_json::Value::String(v.clone()));
             }
-            // TTS nested table (avatar.tts.{language,speed,engine}).
-            if a.tts_language.is_some() || a.tts_speed.is_some() || a.tts_engine.is_some() {
+            // TTS nested table (avatar.tts.*).
+            let needs_tts_obj = a.tts_language.is_some()
+                || a.tts_speed.is_some()
+                || a.tts_engine.is_some()
+                || a.tts_launch_command.is_some()
+                || a.tts_reference_audio.is_some()
+                || a.tts_reference_text.is_some()
+                || a.tts_reference_language.is_some()
+                || a.tts_model_path.is_some()
+                || a.tts_gpu_device.is_some()
+                || a.tts_voice.is_some();
+            if needs_tts_obj {
                 let tts = avatar_obj.entry("tts").or_insert_with(|| serde_json::json!({}));
                 if !tts.is_object() { *tts = serde_json::json!({}); }
                 let tts_obj = tts.as_object_mut().unwrap();
@@ -192,6 +225,27 @@ impl RuntimeOverride {
                 }
                 if let Some(ref v) = a.tts_engine {
                     tts_obj.insert("engine".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = a.tts_launch_command {
+                    tts_obj.insert("launch_command".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = a.tts_reference_audio {
+                    tts_obj.insert("reference_audio".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = a.tts_reference_text {
+                    tts_obj.insert("reference_text".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = a.tts_reference_language {
+                    tts_obj.insert("reference_language".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = a.tts_model_path {
+                    tts_obj.insert("model_path".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(v) = a.tts_gpu_device {
+                    tts_obj.insert("gpu_device".into(), serde_json::Value::Number(v.into()));
+                }
+                if let Some(ref v) = a.tts_voice {
+                    tts_obj.insert("voice".into(), serde_json::Value::String(v.clone()));
                 }
             }
             // Subagent toggles (avatar.subagent.{enabled,only_when_translating}).

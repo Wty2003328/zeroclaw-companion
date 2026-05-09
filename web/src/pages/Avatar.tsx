@@ -1175,6 +1175,8 @@ export default function Avatar() {
             flexDirection: 'column',
             gap: 10,
             minHeight: 0,
+            contain: 'paint',
+            overscrollBehavior: 'contain',
           }}
         >
           {history.length === 0 && (
@@ -1348,6 +1350,9 @@ function ChatBubble({ turn }: { turn: ChatTurn }) {
         alignItems: isUser ? 'flex-end' : 'flex-start',
         gap: 2,
         maxWidth: '100%',
+        // Isolate each chat bubble's paints — long histories with
+        // markdown were the worst offender for scroll lag.
+        contain: 'content',
       }}
     >
       <div style={{ fontSize: 10, color: '#666', padding: '0 4px' }}>

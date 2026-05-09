@@ -27,7 +27,14 @@ export default function Home() {
   return (
     // Outer: scrollable flex item that fills the routes wrapper.
     // Inner: centered content with max-width + horizontal padding.
-    <div style={{ flex: '1 1 0', minHeight: 0, overflow: 'auto' }}>
+    <div style={{
+      flex: '1 1 0', minHeight: 0, overflow: 'auto',
+      // Promote scroll container to its own compositor layer + clip
+      // repaints inside it. Without `contain: paint`, scrolling here
+      // can invalidate the entire window's paint tree on each frame.
+      contain: 'paint',
+      overscrollBehavior: 'contain',
+    }}>
       <div style={{ padding: 28, maxWidth: 880, margin: '0 auto' }}>
         <h1 style={{ marginTop: 0, marginBottom: 12, fontSize: 24 }}>zeroclaw companion</h1>
         <SystemPanels />

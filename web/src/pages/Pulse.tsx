@@ -57,7 +57,11 @@ export default function Pulse() {
   const [error, setError] = useState<string | null>(null);
 
   return (
-    <div style={{ flex: '1 1 0', minHeight: 0, overflow: 'auto' }}>
+    <div style={{
+      flex: '1 1 0', minHeight: 0, overflow: 'auto',
+      contain: 'paint',
+      overscrollBehavior: 'contain',
+    }}>
       <div style={{ padding: 24, maxWidth: 1100, margin: '0 auto' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 16 }}>
           <h1 style={{ margin: 0, fontSize: 24 }}>Pulse</h1>
@@ -602,6 +606,10 @@ function FeedRow({
         cursor: 'pointer',
         opacity: isRead ? 0.65 : 1,
         transition: 'opacity 120ms ease, background 120ms ease',
+        // `contain: content` isolates this row's layout/style/paint
+        // from its siblings — scrolling 100 items doesn't recompute
+        // the layout of off-screen rows.
+        contain: 'content',
       }}
     >
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 4 }}>

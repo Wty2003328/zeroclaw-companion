@@ -167,6 +167,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle().clone();
             spawn_companion_server(&handle);
@@ -198,6 +199,9 @@ pub fn run() {
             open_external_url,
             is_avatar_window_visible,
             open_models_folder,
+            pick_file,
+            pick_folder,
+            list_gpus,
         ])
         .on_window_event(|window, event| {
             // Intercept avatar (overlay) window close: don't destroy
@@ -410,6 +414,153 @@ fn start_dragging_avatar_window(app: AppHandle) -> Result<(), String> {
         .get_webview_window("avatar")
         .ok_or_else(|| "avatar window not found".to_string())?;
     win.start_dragging().map_err(|e| e.to_string())
+}
+
+/// Open a native file picker. Returns the selected path or None if
+/// the user cancelled. Used by the Settings → Voice engine "Browse"
+/// buttons to fill in the launcher script, reference audio, etc.
+///
+/// `filters` is a list of (label, [extensions]) pairs; pass an empty
+/// vec for "any file". `start_dir` is optional and defaults to the
+/// last-opened directory when None.
+#[tauri::command]
+async fn pick_file(
+    app: AppHandle,
+    title: Option<String>,
+    filters: Option<Vec<(String, Vec<String>)>>,
+    start_dir: Option<String>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let mut builder = app.dialog().file();
+    if let Some(t) = title {
+        builder = builder.set_title(t);
+    }
+    if let Some(dir) = start_dir.filter(|s| !s.is_empty()) {
+        builder = builder.set_directory(std::path::PathBuf::from(dir));
+    }
+    if let Some(f_list) = filters {
+        for (label, exts) in f_list {
+            let exts_ref: Vec<&str> = exts.iter().map(|s| s.as_str()).collect();
+            builder = builder.add_filter(&label, &exts_ref);
+        }
+    }
+    // Block on the dialog with a tokio oneshot so the JS invoke awaits
+    // until the user picks or cancels. tauri-plugin-dialog's API is
+    // callback-based on desktop.
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
+    builder.pick_file(move |path| {
+        let _ = tx.send(path.and_then(|p| p.into_path().ok()).map(|p| p.to_string_lossy().to_string()));
+    });
+    rx.await.map_err(|e| e.to_string())
+}
+
+/// Pick a directory (e.g. the GPT-SoVITS install root). Same UX as
+/// `pick_file` but the user selects a folder instead of a file.
+#[tauri::command]
+async fn pick_folder(
+    app: AppHandle,
+    title: Option<String>,
+    start_dir: Option<String>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let mut builder = app.dialog().file();
+    if let Some(t) = title {
+        builder = builder.set_title(t);
+    }
+    if let Some(dir) = start_dir.filter(|s| !s.is_empty()) {
+        builder = builder.set_directory(std::path::PathBuf::from(dir));
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
+    builder.pick_folder(move |path| {
+        let _ = tx.send(path.and_then(|p| p.into_path().ok()).map(|p| p.to_string_lossy().to_string()));
+    });
+    rx.await.map_err(|e| e.to_string())
+}
+
+/// Detected GPU info for the Settings dropdown. The TTS engine uses
+/// the index field; name + vram are display-only.
+#[derive(serde::Serialize)]
+struct GpuInfo {
+    index: i32,
+    name: String,
+    /// Free / total VRAM in MB. None when we can't tell (WMI fallback).
+    vram_total_mb: Option<u64>,
+}
+
+/// Enumerate the GPUs available for TTS inference. Order of attempts:
+///   1. `nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader,nounits`
+///      — gives index + name + total VRAM, the gold standard.
+///   2. `wmic path win32_videocontroller get name` (Windows fallback).
+///      Returns ALL video adapters (including iGPU + virtual ones)
+///      so the indices won't necessarily align with CUDA device ids
+///      — but it's better than showing GPU 0/1/2/3 hardcoded.
+///   3. Empty list — caller should add a "CPU only" option and
+///      maybe a generic "GPU 0" guess.
+///
+/// Always best-effort; never errors out.
+#[tauri::command]
+fn list_gpus() -> Vec<GpuInfo> {
+    // Try nvidia-smi first — most accurate and gives VRAM.
+    if let Ok(out) = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=index,name,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+    {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut gpus = Vec::new();
+            for line in text.lines() {
+                let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+                if parts.len() >= 2 {
+                    let index: i32 = parts[0].parse().unwrap_or(-1);
+                    let name = parts[1].to_string();
+                    let vram_total_mb = parts.get(2).and_then(|s| s.parse::<u64>().ok());
+                    if index >= 0 && !name.is_empty() {
+                        gpus.push(GpuInfo { index, name, vram_total_mb });
+                    }
+                }
+            }
+            if !gpus.is_empty() {
+                return gpus;
+            }
+        }
+    }
+
+    // Windows fallback: WMI via wmic. Returns ALL video controllers,
+    // not just CUDA-capable ones — hopefully fine because most users
+    // either have one GPU or know which slot their training rig is in.
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(out) = std::process::Command::new("wmic")
+            .args(["path", "win32_videocontroller", "get", "name"])
+            .output()
+        {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                let mut gpus = Vec::new();
+                for (i, line) in text.lines().enumerate() {
+                    let trimmed = line.trim();
+                    // First line is "Name" header; skip empty lines.
+                    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("Name") {
+                        continue;
+                    }
+                    gpus.push(GpuInfo {
+                        index: gpus.len() as i32,
+                        name: trimmed.to_string(),
+                        vram_total_mb: None,
+                    });
+                    let _ = i;
+                }
+                if !gpus.is_empty() {
+                    return gpus;
+                }
+            }
+        }
+    }
+
+    Vec::new()
 }
 
 /// Open the Live2D models directory in the OS file explorer.

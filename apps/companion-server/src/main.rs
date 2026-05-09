@@ -522,6 +522,12 @@ async fn handle_get_config(
                 "voice": cfg.tts.voice,
                 "api_url": cfg.tts.api_url,
                 "speed": cfg.tts.speed,
+                "launch_command": cfg.tts.launch_command,
+                "reference_audio": cfg.tts.reference_audio,
+                "reference_text": cfg.tts.reference_text,
+                "reference_language": cfg.tts.reference_language,
+                "model_path": cfg.tts.model_path,
+                "gpu_device": cfg.tts.gpu_device,
             },
             "subagent": {
                 "enabled": cfg.subagent.enabled,
@@ -891,6 +897,20 @@ struct AvatarOverrideRequest {
     tts_speed: Option<f64>,
     /// TTS engine identifier (e.g. "gpt-sovits-v4", "edge-tts").
     tts_engine: Option<String>,
+    /// Full launch command for the TTS server process.
+    tts_launch_command: Option<String>,
+    /// Path to the reference audio clip used for voice cloning.
+    tts_reference_audio: Option<String>,
+    /// Transcript of the reference clip.
+    tts_reference_text: Option<String>,
+    /// Reference clip's language code.
+    tts_reference_language: Option<String>,
+    /// Path to the GPT-SoVITS install root.
+    tts_model_path: Option<String>,
+    /// CUDA device index (0+, or -1 for CPU).
+    tts_gpu_device: Option<i32>,
+    /// Voice id for preset-voice engines (edge-tts, melotts).
+    tts_voice: Option<String>,
     /// Subagent enabled toggle.
     subagent_enabled: Option<bool>,
     /// Skip subagent when chat_lang == tts_lang.
@@ -939,6 +959,29 @@ async fn handle_post_avatar_override(
     }
     if let Some(v) = req.tts_engine {
         av.tts_engine = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.tts_launch_command {
+        av.tts_launch_command = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.tts_reference_audio {
+        av.tts_reference_audio = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.tts_reference_text {
+        av.tts_reference_text = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.tts_reference_language {
+        av.tts_reference_language = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.tts_model_path {
+        av.tts_model_path = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.tts_gpu_device {
+        // Clamp to a sane range. -1 for CPU; 0..=15 for typical multi-GPU.
+        let clamped = v.clamp(-1, 15);
+        av.tts_gpu_device = Some(clamped);
+    }
+    if let Some(v) = req.tts_voice {
+        av.tts_voice = if v.is_empty() { None } else { Some(v) };
     }
     if let Some(v) = req.subagent_enabled { av.subagent_enabled = Some(v); }
     if let Some(v) = req.subagent_only_when_translating { av.subagent_only_when_translating = Some(v); }

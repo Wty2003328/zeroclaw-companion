@@ -26,6 +26,10 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
+# Native file dialogs for Settings → Browse buttons (TTS launcher,
+# reference audio, GPT-SoVITS root). HTML5 <input type=file> hands
+# us a File object; we need the OS-level path to feed the launcher.
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
