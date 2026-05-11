@@ -47,126 +47,363 @@ fn default_chat_language() -> String {
     "en".into()
 }
 
-/// Split text into sentence-sized chunks for streaming synthesis.
+/// Split text into TTS-friendly chunks.
 ///
-/// Boundary characters: `.`, `!`, `?`, `。`, `！`, `？`, newlines.
-/// Chunks shorter than `min_len` are merged with the next sentence so
-/// we don't waste a whole TTS call on "Hi." or " ".
-pub fn split_sentences(text: &str, min_len: usize) -> Vec<String> {
+/// Each chunk is one or more **whole sentences** — we never break
+/// inside a sentence. `target` is a *soft* target chunk length in
+/// chars: whole sentences get packed into the current chunk until it
+/// reaches `target`, then a new one starts. Hard cap is `2 × target`;
+/// a single sentence longer than the cap is sub-split at the last
+/// comma (`,` / `、`) before the cap, never mid-word.
+///
+/// Sentence detection (in `raw_sentences`) treats `。！？!?` and bare
+/// newlines as ends, but is conservative about `.` — it does **not**
+/// end a sentence on a decimal point (`3.14`), an ellipsis (`...`), or
+/// a common abbreviation (`Mr.`, `e.g.`, `U.S.`, single initials).
+/// That keeps the TTS from giving falling sentence-final intonation to
+/// "...the answer is 3" and then starting "14 percent" cold.
+pub fn split_sentences(text: &str, target: usize) -> Vec<String> {
+    let target = target.max(16);
+    let hard_cap = target.saturating_mul(2).max(target + 32);
+
+    // 1. Raw sentences (each includes its terminator + trailing close
+    //    quotes/parens). A sentence longer than the hard cap gets
+    //    sub-split into ~`target`-sized pieces at commas/spaces.
+    let mut sentences: Vec<String> = Vec::new();
+    for s in raw_sentences(text) {
+        if s.chars().count() <= hard_cap {
+            sentences.push(s);
+        } else {
+            sentences.extend(soft_wrap_long(&s, target));
+        }
+    }
+
+    // 2. Greedily pack whole sentences toward `target`.
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len: usize = 0;
+    for s in sentences {
+        let s_len = s.chars().count();
+        if cur_len == 0 {
+            cur = s;
+            cur_len = s_len;
+        } else if cur_len < target && cur_len + s_len <= hard_cap {
+            if needs_space_between(&cur, &s) {
+                cur.push(' ');
+            }
+            cur.push_str(&s);
+            cur_len += s_len; // approx (ignores the optional space) — fine
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur = s;
+            cur_len = s_len;
+        }
+    }
+    if !cur.is_empty() {
+        // A tiny trailing chunk (< a third of target) folds into the
+        // previous one so we don't ship "OK!" or "ね。" on its own —
+        // unless that would push the previous chunk over the hard cap.
+        let last_fits = out
+            .last()
+            .map(|l| l.chars().count() + cur_len <= hard_cap)
+            .unwrap_or(false);
+        if cur_len < target / 3 && last_fits {
+            let last = out.last_mut().unwrap();
+            if needs_space_between(last, &cur) {
+                last.push(' ');
+            }
+            last.push_str(&cur);
+        } else {
+            out.push(cur);
+        }
+    }
+
+    out.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Common English abbreviations that end in `.` but don't end a
+/// sentence. Lowercased; we strip a trailing `.` from the candidate
+/// word before checking, so `e.g.` → `e.g` matches, `Mr.` → `mr`.
+const ABBREVIATIONS: &[&str] = &[
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc",
+    "e.g", "i.e", "a.m", "p.m", "u.s", "u.k", "u.n", "no", "inc", "ltd",
+    "co", "corp", "fig", "vol", "ch", "pp", "approx", "dept", "est",
+    "min", "max", "esp", "cf", "al", // "et al."
+];
+
+/// True if `word` (the run of non-space chars ending right before a
+/// `.`) is something we should NOT treat as a sentence end. Strips
+/// leading/trailing punctuation first, so `(e.g.` → `e.g`, `"Mr.` →
+/// `mr`, `J.` → `j`.
+fn is_abbreviation(word: &str) -> bool {
+    let w = word
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if w.is_empty() {
+        return false;
+    }
+    // A single letter ("J." in "J. R. R. Tolkien", "A." in a numbered
+    // outline) — treat as an abbreviation/initial.
+    if w.chars().count() == 1 && w.chars().next().unwrap().is_alphabetic() {
+        return true;
+    }
+    ABBREVIATIONS.contains(&w.as_str())
+}
+
+/// Walk `text` and emit each sentence as a separate string, terminator
+/// included. Conservative about `.` — see `split_sentences` doc.
+fn raw_sentences(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<String> = Vec::new();
     let mut buf = String::new();
-    for ch in text.chars() {
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
         buf.push(ch);
-        let is_terminal = matches!(ch, '.' | '!' | '?' | '。' | '！' | '？' | '\n');
-        if is_terminal && buf.trim().chars().count() >= min_len {
-            out.push(buf.trim().to_string());
+        let prev = if i > 0 { Some(chars[i - 1]) } else { None };
+        let next = chars.get(i + 1).copied();
+
+        let is_end = match ch {
+            // CJK sentence-final punctuation: unambiguous.
+            '。' | '！' | '？' => true,
+            // ASCII `!` / `?` — practically always a sentence end.
+            '!' | '?' => true,
+            // A bare newline ends the current line/paragraph. Markdown
+            // structure (`#`, `-`, `>`) is stripped downstream; what we
+            // care about here is not gluing two paragraphs into one
+            // breath.
+            '\n' => true,
+            '.' => {
+                // Decimal point: digit . digit  → not a sentence end.
+                let between_digits = prev.is_some_and(|c| c.is_ascii_digit())
+                    && next.is_some_and(|c| c.is_ascii_digit());
+                // Ellipsis: part of a `..`/`...` run → not an end on
+                // its own (the run continues; a real end may follow).
+                let in_ellipsis = prev == Some('.') || next == Some('.');
+                if between_digits || in_ellipsis {
+                    false
+                } else {
+                    // Abbreviation: look back to the start of the word
+                    // that the `.` closes.
+                    let word_start = buf
+                        .char_indices()
+                        .rev()
+                        .find(|&(_, c)| c.is_whitespace())
+                        .map(|(idx, c)| idx + c.len_utf8())
+                        .unwrap_or(0);
+                    let word = &buf[word_start..];
+                    !is_abbreviation(word)
+                }
+            }
+            _ => false,
+        };
+
+        i += 1;
+        if is_end {
+            // Pull in trailing close-quotes / parens / a following
+            // closing CJK quote so they ride with the sentence they
+            // close rather than orphaning at the next chunk's head.
+            while let Some(&c) = chars.get(i) {
+                if matches!(c, '"' | '\'' | ')' | ']' | '}' | '」' | '』' | '）' | '"') {
+                    buf.push(c);
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let s = buf.trim();
+            if !s.is_empty() {
+                out.push(s.to_string());
+            }
             buf.clear();
         }
     }
     let tail = buf.trim();
     if !tail.is_empty() {
-        // If the last fragment is too short to stand alone, fold it
-        // into the previous chunk.
-        if tail.chars().count() < min_len && !out.is_empty() {
-            let last = out.last_mut().unwrap();
-            last.push(' ');
-            last.push_str(tail);
-        } else {
-            out.push(tail.to_string());
-        }
+        out.push(tail.to_string());
     }
-    out.into_iter().filter(|s| !s.is_empty()).collect()
+    out
+}
+
+/// Sub-split a single over-long sentence at the last comma (ASCII `,`
+/// or CJK `、`) before `cap` chars; if there's no comma in range, hard-
+/// wrap at `cap` on a char boundary (never inside a char, never inside
+/// a word for ASCII — backs up to the last space).
+fn soft_wrap_long(sentence: &str, cap: usize) -> Vec<String> {
+    let chars: Vec<char> = sentence.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    while chars.len() - start > cap {
+        // Window [start, start+cap). Prefer a comma; else a space.
+        let window_end = start + cap;
+        let mut split_at = None;
+        for j in (start + cap / 2..window_end).rev() {
+            if matches!(chars[j], ',' | '、') {
+                split_at = Some(j + 1); // include the comma
+                break;
+            }
+        }
+        if split_at.is_none() {
+            for j in (start + cap / 2..window_end).rev() {
+                if chars[j].is_whitespace() {
+                    split_at = Some(j); // break before the space
+                    break;
+                }
+            }
+        }
+        let end = split_at.unwrap_or(window_end);
+        let piece: String = chars[start..end].iter().collect();
+        let piece = piece.trim();
+        if !piece.is_empty() {
+            out.push(piece.to_string());
+        }
+        start = end;
+    }
+    let rest: String = chars[start..].iter().collect();
+    let rest = rest.trim();
+    if !rest.is_empty() {
+        out.push(rest.to_string());
+    }
+    out
+}
+
+/// Whether to put a space between two chunks being joined. Latin text
+/// uses inter-sentence spaces; CJK doesn't. Heuristic: space iff the
+/// last char of `a` or the first char of `b` is ASCII.
+fn needs_space_between(a: &str, b: &str) -> bool {
+    let last = a.chars().last();
+    let first = b.chars().next();
+    let ascii_ish = |c: Option<char>| c.is_some_and(|c| c.is_ascii());
+    ascii_ish(last) || ascii_ish(first)
 }
 
 #[cfg(test)]
 mod tests_split {
     use super::*;
 
-    #[test]
-    fn splits_english_sentences() {
-        let v = split_sentences("Hello there. How are you? Good!", 4);
-        assert_eq!(v, vec!["Hello there.", "How are you?", "Good!"]);
-    }
+    const T: usize = 80; // production-ish target
 
-    #[test]
-    fn merges_short_tail() {
-        let v = split_sentences("Hello there. Hi", 4);
-        assert_eq!(v, vec!["Hello there. Hi"]);
+    fn rejoin(v: &[String]) -> String {
+        // Collapse runs of whitespace so the comparison ignores the
+        // optional inter-chunk space the packer may insert.
+        v.join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
     }
-
-    #[test]
-    fn handles_japanese_terminators() {
-        let v = split_sentences("こんにちは。お元気ですか？", 2);
-        assert_eq!(v, vec!["こんにちは。", "お元気ですか？"]);
+    fn normspace(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     #[test]
     fn empty_input_yields_nothing() {
-        assert!(split_sentences("", 4).is_empty());
+        assert!(split_sentences("", T).is_empty());
+        assert!(split_sentences("   \n  ", T).is_empty());
     }
 
     #[test]
     fn no_terminator_returns_whole_text() {
-        let v = split_sentences("just a phrase no period", 4);
-        assert_eq!(v, vec!["just a phrase no period"]);
+        assert_eq!(split_sentences("just a phrase no period", T), vec!["just a phrase no period"]);
     }
 
-    /// Realistic Japanese reply with mixed terminators + leading
-    /// short sentence. We expect short fragments to merge with the
-    /// next, so chunk 1 has clean prosody for TTS.
+    /// Round-trip: rejoining the chunks (modulo whitespace) must equal
+    /// the input. We never drop or reorder text.
     #[test]
-    fn japanese_reply_merges_short_lead() {
-        let text = "こんにちは！アスナです。明日に向けてサポートするね！";
-        let v = split_sentences(text, 24);
-        // The first 6-char "こんにちは！" should merge with the next
-        // sentence rather than being shipped to TTS on its own.
-        assert!(v[0].chars().count() >= 24, "first chunk too short: {:?}", v[0]);
-    }
-
-    /// Numeric like "1." should not trigger a split when the
-    /// preceding text would be too short.
-    #[test]
-    fn numeric_periods_dont_split() {
-        let text = "Try this. 1. First tip. 2. Second tip.";
-        let v = split_sentences(text, 16);
-        // We don't want chunks like "1." or "2." escaping on their own.
-        for chunk in &v {
-            assert!(
-                chunk.trim().chars().count() >= 4,
-                "chunk too short to be a real sentence: {:?}",
-                chunk
-            );
+    fn order_and_content_preserved() {
+        for input in [
+            "First. Second. Third.",
+            "こんにちは！アスナです。明日に向けてサポートするよ！あなたはどうですか？",
+            "Mixed です。 And English. そして more 日本語。",
+            "Try this. 1. First tip. 2. Second tip.",
+        ] {
+            let v = split_sentences(input, T);
+            assert_eq!(rejoin(&v), normspace(input), "round-trip failed for {input:?}");
         }
     }
 
-    /// Diagnostic: print what real Japanese translations chunk into
-    /// so we can sanity-check the chunk sizes are TTS-friendly.
-    /// Run: `cargo test -p companion-avatar dump_japanese_chunks --release -- --nocapture`
+    /// Decimals are not sentence ends — "3.14" must not be cut.
     #[test]
-    fn dump_japanese_chunks() {
+    fn decimal_points_dont_split() {
+        let v = split_sentences("Pi is roughly 3.14159 which is enough. Next thing.", T);
+        assert!(v.iter().any(|c| c.contains("3.14159")), "decimal got split: {v:?}");
+        assert!(!v.iter().any(|c| c.trim() == "14159 which is enough."), "split mid-decimal: {v:?}");
+    }
+
+    /// Common abbreviations don't end a sentence.
+    #[test]
+    fn abbreviations_dont_split() {
+        // With a small target so packing wouldn't otherwise glue them.
+        let v = split_sentences("Talk to Dr. Smith about it. Then call Mr. Jones.", 24);
+        assert!(v.iter().any(|c| c.contains("Dr. Smith")), "Dr. got split: {v:?}");
+        assert!(v.iter().any(|c| c.contains("Mr. Jones")), "Mr. got split: {v:?}");
+        // "e.g." mid-sentence.
+        let v2 = split_sentences("Use a fast model, e.g. gpt-4o-mini, for this. Done.", 24);
+        assert!(v2.iter().any(|c| c.contains("e.g. gpt-4o-mini")), "e.g. got split: {v2:?}");
+    }
+
+    /// Ellipsis doesn't fragment.
+    #[test]
+    fn ellipsis_doesnt_fragment() {
+        let v = split_sentences("Hmm... maybe later. Sure.", 24);
+        assert!(v.iter().any(|c| c.contains("Hmm... maybe later.")), "ellipsis fragmented: {v:?}");
+    }
+
+    /// No chunk exceeds the hard cap (2× target, min target+32).
+    #[test]
+    fn respects_hard_cap() {
+        let long_sentence = "あ".repeat(500) + "。"; // a single 501-char sentence
+        let cap = (T * 2).max(T + 32);
+        for c in split_sentences(&long_sentence, T) {
+            assert!(c.chars().count() <= cap, "chunk over cap: {} chars", c.chars().count());
+        }
+    }
+
+    /// Whole-sentence boundaries: every chunk (except possibly the
+    /// last, if the input had no trailing terminator) ends with a
+    /// terminator or a close-quote following one — never mid-sentence.
+    #[test]
+    fn chunks_end_on_sentence_boundaries() {
+        let v = split_sentences(
+            "こんにちは！アスナです。明日に向けてサポートするよ！あなたはどうですか？それじゃ、頑張ろうね。",
+            T,
+        );
+        for (i, c) in v.iter().enumerate() {
+            let last_real = c.trim_end_matches(|ch: char| {
+                matches!(ch, '"' | '\'' | ')' | ']' | '}' | '」' | '』' | '）')
+            }).chars().last().unwrap();
+            let ok = matches!(last_real, '.' | '!' | '?' | '。' | '！' | '？');
+            assert!(ok || i + 1 == v.len(), "chunk {i} ends mid-sentence: {c:?}");
+        }
+    }
+
+    /// Diagnostic dump — run with:
+    ///   cargo test -p companion-avatar dump_chunks --release -- --nocapture
+    #[test]
+    fn dump_chunks() {
         let cases: &[(&str, &str)] = &[
-            ("short", "こんにちは！アスナです。"),
-            ("medium", "こんにちは！アスナです。明日に向けてサポートするよ！あなたはどうですか？"),
-            ("long",
-             "こんにちは！アスナです！ゲームでレベルを上げる時でも、実際の試験に備える時でも、本当に役立つ勉強のコツを3つご紹介します。1つ目はポモドーロテクニック。25分集中して5分休憩を繰り返します。2つ目はアクティブリコール。3つ目は十分な睡眠です。"),
+            ("short-ja", "こんにちは！アスナです。"),
+            ("medium-ja", "こんにちは！アスナです。明日に向けてサポートするよ！あなたはどうですか？"),
+            ("long-ja",
+             "こんにちは！アスナです！ゲームでレベルを上げる時でも、実際の試験に備える時でも、本当に役立つ勉強のコツを3つご紹介します。1つ目はポモドーロテクニック。25分集中して5分休憩を繰り返します。2つ目はアクティブリコール。学んだことを思い出す練習をしましょう。3つ目は十分な睡眠です。記憶の定着には睡眠がとても大切なんだよ。"),
+            ("long-en",
+             "Hey, welcome back — long day at work? I figured you'd be tired so I kept it low-key. \
+              By the way, the answer to your question earlier is roughly 3.14159, give or take. \
+              If you want to dig into it more, Dr. Smith's notes (e.g. the section on convergence) cover it well. \
+              Anyway... want to watch something, or are you heading to bed? Either way I'm here."),
+            ("run-on-en",
+             "I think we should first set up the environment then install the dependencies then configure \
+              the database connection then run the migrations then start the dev server and only after \
+              all of that is working should we even think about writing the actual feature code because \
+              otherwise we'll be debugging plumbing instead of logic and that's a waste of an evening."),
         ];
         for (name, text) in cases {
-            let v = split_sentences(text, 24);
-            eprintln!("\n--- {name} (len={}c, {} chunks) ---", text.chars().count(), v.len());
+            let v = split_sentences(text, 80);
+            eprintln!("\n=== {name} (input {}c → {} chunk(s)) ===", text.chars().count(), v.len());
             for (i, c) in v.iter().enumerate() {
-                eprintln!("  [{}] {}c: {}", i, c.chars().count(), c);
+                eprintln!("  [{i}] {:>3}c | {c}", c.chars().count());
             }
         }
-    }
-
-    /// Order is preserved verbatim — chunks reassembled (with spaces)
-    /// must equal the original (modulo trim).
-    #[test]
-    fn order_preserved() {
-        let text = "First. Second. Third.";
-        let v = split_sentences(text, 4);
-        let rejoined: String = v.iter().map(|s| s.trim()).collect::<Vec<_>>().join(" ");
-        assert_eq!(rejoined.replace("  ", " "), "First. Second. Third.");
     }
 }
 
@@ -216,23 +453,29 @@ pub struct AvatarTtsConfig {
     /// fall back to single-shot synthesis (whole reply as one WAV).
     #[serde(default = "default_true")]
     pub streaming: bool,
-    /// Minimum sentence length (in chars) before chunking. Anything
-    /// shorter gets merged with the next sentence so we don't waste a
-    /// TTS call on a one-word fragment.
-    #[serde(default = "default_streaming_min_chars")]
+    /// Target chunk length (in chars) for TTS streaming. The chunker
+    /// packs *whole sentences* into chunks until they reach roughly
+    /// this length, then starts a new one — never breaking inside a
+    /// sentence. Larger → more natural prosody (the TTS model plans
+    /// intonation across the whole chunk) but slower time-to-first-
+    /// audio; smaller → snappier first audio but choppier. ~80 ≈ a
+    /// couple of short sentences ≈ 4-6 s of speech, which is the
+    /// sweet spot. A chunk never exceeds `2×` this; a single sentence
+    /// longer than that is sub-split at commas (still never mid-word).
+    #[serde(default = "default_streaming_min_chars", alias = "streaming_target_chars")]
     pub streaming_min_chars: usize,
 }
 
 fn default_streaming_min_chars() -> usize {
-    // Was 8 — too low for Japanese TTS (GPT-SoVITS prosody is poor
-    // on <10-char inputs; we shipped one-word chunks like "Hi!" or
-    // "アスナです" and they sounded clipped). 24 corresponds to
-    // ~3-4 seconds of speech: long enough for clean prosody, short
-    // enough that first-audio still arrives ~3-5s after the subagent
-    // returns. Override in companion.toml `[avatar.tts]
-    // streaming_min_chars = 12` for snappier first audio at the cost
-    // of choppier early sentences.
-    24
+    // History: 8 (one-word chunks, clipped prosody) → 24 (still glued
+    // 3-4 short sentences into one chunk because the old logic merged
+    // forward until it crossed the threshold) → 80 (this). 80 chars
+    // is ~a couple of short Japanese sentences; the chunker now packs
+    // whole sentences *toward* this length rather than treating it as
+    // a hard floor, so chunk boundaries always land at real sentence
+    // ends. Override in companion.toml `[avatar.tts] streaming_min_chars`
+    // — lower for snappier first audio, higher for fewer/longer chunks.
+    80
 }
 
 fn default_tts_engine() -> String {

@@ -609,28 +609,63 @@ async fn send_notification(
     Ok(())
 }
 
-/// Pop the first complete sentence from `buf` if one ends with a
-/// terminator AND the trimmed length meets `min_len`. Returns the
-/// drained sentence text on success.
-fn pop_first_sentence(buf: &mut String, min_len: usize) -> Option<String> {
-    // Walk char boundaries to find the next terminator with enough
-    // text behind it.
-    let mut byte_end: Option<usize> = None;
-    let mut so_far: usize = 0;
-    for (idx, ch) in buf.char_indices() {
-        so_far += 1;
-        if matches!(ch, '.' | '!' | '?' | '。' | '！' | '？' | '\n') {
-            if so_far >= min_len {
-                byte_end = Some(idx + ch.len_utf8());
+/// Pop the first complete sentence(s) from `buf` once at least
+/// `target` chars have accumulated and a *real* sentence terminator
+/// appears. "Real" excludes a `.` that's a decimal (`3.14`) or part
+/// of an ellipsis (`...`) — those would otherwise cut a number or a
+/// trailing-off phrase mid-stride and hand the TTS a fragment with
+/// falling sentence-final intonation. CJK `。！？` and ASCII `!?` are
+/// always real ends. Returns the drained text (trimmed) on success.
+fn pop_first_sentence(buf: &mut String, target: usize) -> Option<String> {
+    let chars: Vec<char> = buf.chars().collect();
+    // Map char index → byte offset of the char *after* that char, so
+    // we can slice `buf` cleanly.
+    let mut byte_after: Vec<usize> = Vec::with_capacity(chars.len());
+    {
+        let mut acc = 0usize;
+        for c in &chars {
+            acc += c.len_utf8();
+            byte_after.push(acc);
+        }
+    }
+    for i in 0..chars.len() {
+        let ch = chars[i];
+        if i + 1 < target {
+            // Not enough text behind this position yet.
+            continue;
+        }
+        let is_real_end = match ch {
+            '。' | '！' | '？' | '!' | '?' => true,
+            '\n' => true,
+            '.' => {
+                let prev = if i > 0 { Some(chars[i - 1]) } else { None };
+                let next = chars.get(i + 1).copied();
+                let decimal = prev.is_some_and(|c| c.is_ascii_digit())
+                    && next.is_some_and(|c| c.is_ascii_digit());
+                let ellipsis = prev == Some('.') || next == Some('.');
+                !(decimal || ellipsis)
+            }
+            _ => false,
+        };
+        if !is_real_end {
+            continue;
+        }
+        // Pull in trailing close-quotes/parens so they ride along.
+        let mut end_char = i + 1;
+        while let Some(&c) = chars.get(end_char) {
+            if matches!(c, '"' | '\'' | ')' | ']' | '}' | '」' | '』' | '）') {
+                end_char += 1;
+            } else {
                 break;
             }
         }
+        let end_byte = byte_after[end_char - 1];
+        let sentence = buf[..end_byte].to_string();
+        let rest = buf[end_byte..].to_string();
+        *buf = rest;
+        return Some(sentence.trim().to_string()).filter(|s| !s.is_empty());
     }
-    let end = byte_end?;
-    let sentence = buf[..end].to_string();
-    let rest = buf[end..].to_string();
-    *buf = rest;
-    Some(sentence.trim().to_string()).filter(|s| !s.is_empty())
+    None
 }
 
 /// Streaming pipeline. Bcasts initial Expression/Text/Debug, then
