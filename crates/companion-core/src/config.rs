@@ -1,7 +1,9 @@
 //! Top-level companion configuration.
 //!
 //! Loaded from `companion.toml`. Section ownership:
-//! - `[zeroclaw]`     — connection to upstream zeroclaw daemon
+//! - `[zeroclaw]`     — connection to the upstream agent daemon. Despite
+//!   the name (kept for back-compat), the companion can drive zeroclaw,
+//!   openclaw, or hermes-agent here — pick via `kind`.
 //! - `[server]`       — companion's own HTTP/WS bind
 //! - `[avatar]`       — Live2D avatar subsystem (companion-avatar consumes)
 //! - `[avatar.tts]`   — TTS port + language config
@@ -11,6 +13,70 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+/// Which upstream agent daemon the companion is driving.
+///
+/// All three are members of the pi-agent-family (zeroclaw is a Rust
+/// fork, openclaw is the Node fork, hermes-agent is the Python fork
+/// from Nous Research), but they expose *different* HTTP surfaces:
+///
+/// | kind     | chat endpoint                  | request shape                                        | response shape                              |
+/// |----------|--------------------------------|------------------------------------------------------|---------------------------------------------|
+/// | Zeroclaw | `POST /webhook`                | `{"message": "..."}`                                 | `{"model","response"}`                      |
+/// | Openclaw | `POST /v1/chat/completions`    | `{"model":"openclaw","messages":[{...}]}` (OpenAI)   | OpenAI completion (`choices[0].message`)    |
+/// | Hermes   | `POST /webhook`                | `{"message": "..."}` *(via the bridge — see README)* | `{"model","response"}`                      |
+/// | Custom   | `POST /webhook`                | same as Zeroclaw                                     | same as Zeroclaw                            |
+///
+/// Hermes is reached through a small Python HTTP shim (`hermes-bridge.py`)
+/// that shells out to `hermes -z "<msg>"` because hermes-agent itself
+/// has no synchronous HTTP chat endpoint. The bridge mirrors zeroclaw's
+/// `/webhook` shape so this code can treat them the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentKind {
+    Zeroclaw,
+    Openclaw,
+    Hermes,
+    Custom,
+}
+
+impl Default for AgentKind {
+    fn default() -> Self {
+        Self::Zeroclaw
+    }
+}
+
+impl AgentKind {
+    /// Default port each agent's gateway binds to. Used by the Settings
+    /// UI to prefill the URL when the user picks a kind, and by the
+    /// LAN-probe helper to know which ports are worth trying.
+    pub fn default_port(self) -> u16 {
+        match self {
+            AgentKind::Zeroclaw | AgentKind::Custom => 42617,
+            AgentKind::Openclaw => 18790,
+            AgentKind::Hermes => 18791,
+        }
+    }
+    /// Human-friendly label for log lines and error messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentKind::Zeroclaw => "zeroclaw",
+            AgentKind::Openclaw => "openclaw",
+            AgentKind::Hermes => "hermes",
+            AgentKind::Custom => "custom",
+        }
+    }
+    /// Parse the lowercase string form (matches the serde rename).
+    /// Unknown values fall through to `Zeroclaw` — the safe default.
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "openclaw" => AgentKind::Openclaw,
+            "hermes" => AgentKind::Hermes,
+            "custom" => AgentKind::Custom,
+            _ => AgentKind::Zeroclaw,
+        }
+    }
+}
 
 /// Top-level companion configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +156,41 @@ pub struct RuntimeOverride {
     /// Optional override for `[avatar.subagent]` knobs.
     #[serde(default)]
     pub subagent: Option<SubagentOverride>,
+    /// Optional override for `[zeroclaw]` connection (url, pair token,
+    /// timeout). Lets the user point the companion at a zeroclaw on
+    /// another machine — a home server, a Raspberry Pi, a laptop on
+    /// the LAN — without editing companion.toml. The companion never
+    /// gives zeroclaw access to the machine it runs on; it's a thin
+    /// client (avatar + TTS + chat UI) that POSTs chat to zeroclaw's
+    /// `/webhook` and renders the reply.
+    #[serde(default)]
+    pub zeroclaw: Option<ZeroclawOverride>,
+}
+
+/// Upstream agent connection overrides. `Some` replaces the companion.toml
+/// value; `None` leaves it. Changing any of these needs a companion-
+/// server restart — the `ZeroclawClient` is built once at startup.
+///
+/// Despite the type name (kept for back-compat with the runtime.json
+/// schema), this also covers openclaw and hermes via `kind`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZeroclawOverride {
+    /// Which agent flavor sits at `url`. Drives both the HTTP shape used
+    /// for chat and which default port the UI prefills. `None` leaves
+    /// the value from companion.toml in place.
+    #[serde(default)]
+    pub kind: Option<AgentKind>,
+    /// Base URL of the agent HTTP gateway, e.g.
+    /// `http://192.168.1.50:42617` for a LAN box.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Pairing/bearer token, if the deployment requires one (zeroclaw
+    /// with pairing on; openclaw requires it when binding to LAN).
+    #[serde(default)]
+    pub pair_token: Option<String>,
+    /// Per-request timeout for the chat call, in seconds.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Avatar/TTS knobs the user flips frequently. Anything `Some` replaces
@@ -305,6 +406,24 @@ impl RuntimeOverride {
                 }
             }
         }
+        if let Some(ref z) = self.zeroclaw {
+            // Zeroclaw is a typed struct (not a JSON Value like avatar),
+            // so we patch its fields directly.
+            if let Some(k) = z.kind {
+                cfg.zeroclaw.kind = k;
+            }
+            if let Some(ref v) = z.url {
+                if !v.trim().is_empty() {
+                    cfg.zeroclaw.url = v.trim().trim_end_matches('/').to_string();
+                }
+            }
+            if let Some(ref v) = z.pair_token {
+                cfg.zeroclaw.pair_token = if v.is_empty() { None } else { Some(v.clone()) };
+            }
+            if let Some(v) = z.timeout_secs {
+                cfg.zeroclaw.timeout_secs = v;
+            }
+        }
     }
 }
 
@@ -319,30 +438,35 @@ impl Default for CompanionConfig {
     }
 }
 
-/// Connection to the upstream zeroclaw daemon.
+/// Connection to the upstream agent daemon (zeroclaw / openclaw / hermes).
+///
+/// Type name kept as `ZeroclawConfig` for back-compat — the actual kind
+/// is selected by the `kind` field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZeroclawConfig {
-    /// Base URL of the zeroclaw HTTP gateway. Default `http://127.0.0.1:8080`.
+    /// Which agent flavor `url` points at. Default `zeroclaw`.
+    #[serde(default)]
+    pub kind: AgentKind,
+    /// Base URL of the agent HTTP gateway. Default `http://127.0.0.1:42617`
+    /// (zeroclaw's default port).
     #[serde(default = "default_zeroclaw_url")]
     pub url: String,
-    /// Optional pairing token for authenticated zeroclaw deployments.
+    /// Optional pairing/bearer token for authenticated deployments.
+    /// Required for openclaw when binding to LAN; optional for zeroclaw.
     #[serde(default)]
     pub pair_token: Option<String>,
-    /// HTTP timeout in seconds for `POST /webhook` chat calls.
+    /// HTTP timeout in seconds for the chat call.
     ///
-    /// Default 300s — enough headroom for zeroclaw's full agent loop
-    /// including tool-use rounds. Common queries that need this:
-    /// - "tell me news about X" (multi-step web_search)
-    /// - "browse this URL" (browser tool)
-    /// - any cron schedule / shell command path
-    /// Smaller values will return 502 from companion's /api/chat when
-    /// the agent runs longer than the budget.
+    /// Default 300s — enough headroom for the agent's full tool-use loop
+    /// (web search, browser tool, cron schedule, shell). Smaller values
+    /// return 502 from companion's /api/chat when the agent runs longer
+    /// than the budget.
     #[serde(default = "default_zeroclaw_timeout")]
     pub timeout_secs: u64,
 }
 
 fn default_zeroclaw_url() -> String {
-    "http://127.0.0.1:8080".into()
+    "http://127.0.0.1:42617".into()
 }
 
 fn default_zeroclaw_timeout() -> u64 {
@@ -352,6 +476,7 @@ fn default_zeroclaw_timeout() -> u64 {
 impl Default for ZeroclawConfig {
     fn default() -> Self {
         Self {
+            kind: AgentKind::default(),
             url: default_zeroclaw_url(),
             pair_token: None,
             timeout_secs: default_zeroclaw_timeout(),
@@ -411,7 +536,47 @@ mod tests {
     #[test]
     fn defaults_apply_when_omitted() {
         let cfg: CompanionConfig = toml::from_str("").unwrap();
-        assert_eq!(cfg.zeroclaw.url, "http://127.0.0.1:8080");
+        assert_eq!(cfg.zeroclaw.url, "http://127.0.0.1:42617");
+        assert_eq!(cfg.zeroclaw.kind, AgentKind::Zeroclaw);
         assert_eq!(cfg.server.port, 9181);
+    }
+
+    #[test]
+    fn parses_agent_kind() {
+        let toml = r#"
+            [zeroclaw]
+            kind = "openclaw"
+            url = "http://192.168.1.100:18790"
+            pair_token = "abc"
+        "#;
+        let cfg: CompanionConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.zeroclaw.kind, AgentKind::Openclaw);
+        assert_eq!(cfg.zeroclaw.pair_token.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn agent_kind_default_ports() {
+        assert_eq!(AgentKind::Zeroclaw.default_port(), 42617);
+        assert_eq!(AgentKind::Openclaw.default_port(), 18790);
+        assert_eq!(AgentKind::Hermes.default_port(), 18791);
+        assert_eq!(AgentKind::Custom.default_port(), 42617);
+    }
+
+    #[test]
+    fn override_patches_kind() {
+        let mut cfg = CompanionConfig::default();
+        let over = RuntimeOverride {
+            zeroclaw: Some(ZeroclawOverride {
+                kind: Some(AgentKind::Hermes),
+                url: Some("http://10.0.0.5:18791".into()),
+                pair_token: None,
+                timeout_secs: Some(60),
+            }),
+            ..Default::default()
+        };
+        over.apply(&mut cfg);
+        assert_eq!(cfg.zeroclaw.kind, AgentKind::Hermes);
+        assert_eq!(cfg.zeroclaw.url, "http://10.0.0.5:18791");
+        assert_eq!(cfg.zeroclaw.timeout_secs, 60);
     }
 }

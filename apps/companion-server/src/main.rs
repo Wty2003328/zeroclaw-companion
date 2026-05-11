@@ -29,7 +29,7 @@ use companion_avatar::{
     AnimeTtsManager, AvatarConfig, AvatarEvent, AvatarSubagent, AvatarWsState,
     handle_ws_avatar,
 };
-use companion_core::{AgentEvent, CompanionConfig, ZeroclawClient};
+use companion_core::{AgentEvent, AgentKind, CompanionConfig, ZeroclawClient};
 use companion_pulse::{PulseConfig, PulseSubsystem};
 
 mod characters;
@@ -44,12 +44,17 @@ async fn main() -> Result<()> {
     tracing::info!("companion: loading config from {}", config_path.display());
     let cfg = CompanionConfig::load(&config_path)?;
 
-    // ── 1. Talk to upstream zeroclaw ──────────────────────────────
+    // ── 1. Talk to the upstream agent (zeroclaw / openclaw / hermes) ──
     let zc = ZeroclawClient::new(&cfg.zeroclaw)?;
     match zc.health().await {
-        Ok(true) => tracing::info!("companion: zeroclaw at {} is up", cfg.zeroclaw.url),
+        Ok(true) => tracing::info!(
+            "companion: {} at {} is up",
+            cfg.zeroclaw.kind.label(),
+            cfg.zeroclaw.url
+        ),
         Ok(false) | Err(_) => tracing::warn!(
-            "companion: zeroclaw at {} unreachable — chat features will be limited until it comes up",
+            "companion: {} at {} unreachable — chat features will be limited until it comes up",
+            cfg.zeroclaw.kind.label(),
             cfg.zeroclaw.url
         ),
     }
@@ -98,6 +103,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/config/avatar",
             axum::routing::post(handle_post_avatar_override),
+        )
+        .route(
+            "/api/config/zeroclaw",
+            axum::routing::post(handle_post_zeroclaw_override),
         )
         .route("/api/models", get(handle_list_models))
         .route(
@@ -549,9 +558,21 @@ async fn handle_get_config(
             },
         })
     });
+    let zc_up = state.zeroclaw.health().await.unwrap_or(false);
     axum::Json(serde_json::json!({
         "avatar": avatar,
-        "zeroclaw_url": state.zeroclaw.health().await.ok().map(|_| "ok"),
+        // Connection to the (possibly remote) agent daemon. The
+        // pairing token is never sent back — only whether one is set.
+        // `kind` is one of "zeroclaw" | "openclaw" | "hermes" | "custom".
+        "zeroclaw": {
+            "kind": state.zeroclaw.kind().label(),
+            "url": state.zeroclaw.base_url(),
+            "timeout_secs": state.zeroclaw.timeout_secs(),
+            "pair_token_set": state.zeroclaw.has_pair_token(),
+            "reachable": zc_up,
+        },
+        // Legacy field some older UI builds read; keep for one release.
+        "zeroclaw_url": if zc_up { Some("ok") } else { None },
     }))
 }
 
@@ -1003,6 +1024,78 @@ async fn handle_post_avatar_override(
     })?;
     tracing::info!(
         "companion: wrote avatar override to {} (restart required to apply)",
+        path.display()
+    );
+    Ok(axum::http::StatusCode::ACCEPTED)
+}
+
+#[derive(serde::Deserialize)]
+struct ZeroclawOverrideRequest {
+    /// Which agent flavor: "zeroclaw" | "openclaw" | "hermes" | "custom".
+    /// Empty / missing leaves the saved value alone. Unknown values fall
+    /// through to "zeroclaw" (defensive — Settings only sends valid ids).
+    kind: Option<String>,
+    /// Base URL of the agent gateway (e.g. http://192.168.1.100:42617).
+    url: Option<String>,
+    /// Pairing/bearer token. Empty string clears it.
+    pair_token: Option<String>,
+    /// Per-request timeout in seconds.
+    timeout_secs: Option<u64>,
+}
+
+/// Persist the zeroclaw connection override (url / pair token /
+/// timeout) to companion.runtime.json. Restart-required: the
+/// ZeroclawClient is built once at companion-server startup, so the
+/// Settings UI shows a "Restart" button after a successful save.
+///
+/// This is what lets the companion talk to a zeroclaw running on a
+/// different machine — a home server, a Raspberry Pi, a laptop on the
+/// LAN. The companion is a thin client; it never asks zeroclaw to do
+/// anything on the machine companion itself runs on.
+async fn handle_post_zeroclaw_override(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::Json(req): axum::Json<ZeroclawOverrideRequest>,
+) -> axum::response::Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    use companion_core::{RuntimeOverride, runtime_override_path};
+
+    let path = runtime_override_path(&state.config_path);
+    let mut over = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|b| serde_json::from_str::<RuntimeOverride>(&b).ok())
+            .unwrap_or_default()
+    } else {
+        RuntimeOverride::default()
+    };
+
+    let mut zc = over.zeroclaw.unwrap_or_default();
+    if let Some(ref v) = req.kind {
+        if !v.trim().is_empty() {
+            zc.kind = Some(AgentKind::from_str_lossy(v));
+        }
+    }
+    if let Some(v) = req.url {
+        let trimmed = v.trim().trim_end_matches('/').to_string();
+        zc.url = if trimmed.is_empty() { None } else { Some(trimmed) };
+    }
+    if let Some(v) = req.pair_token {
+        zc.pair_token = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.timeout_secs {
+        // 5s floor (the agent loop barely starts in less),
+        // 1800s ceiling so a typo can't make a request hang for hours.
+        zc.timeout_secs = Some(v.clamp(5, 1800));
+    }
+    over.zeroclaw = Some(zc);
+
+    let body = serde_json::to_string_pretty(&over).map_err(|e| {
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("serialize override: {e}"))
+    })?;
+    std::fs::write(&path, body).map_err(|e| {
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("write {}: {e}", path.display()))
+    })?;
+    tracing::info!(
+        "companion: wrote zeroclaw override to {} (restart required to apply)",
         path.display()
     );
     Ok(axum::http::StatusCode::ACCEPTED)

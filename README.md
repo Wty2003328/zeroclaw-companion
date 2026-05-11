@@ -217,6 +217,120 @@ cargo run --release -p companion-server
 # → http://127.0.0.1:9181/
 ```
 
+## Running the main agent (zeroclaw / openclaw / hermes)
+
+The companion is a **thin client** — avatar + TTS + chat UI. It POSTs
+your messages to the agent and renders the reply. It never asks the
+agent to do anything on the machine the companion runs on, so the
+agent can live anywhere reachable on your network: a home server, a
+Raspberry Pi, a spare laptop.
+
+You pick which agent flavor in **Settings → Main agent**. All three
+are pi-agent-family forks; they expose different chat endpoints, but
+share an unauthenticated `GET /health` for the reachability check.
+
+| Kind     | Lang   | Default port | Chat endpoint                 |
+|----------|--------|--------------|-------------------------------|
+| zeroclaw | Rust   | 42617        | `POST /webhook` `{message}`   |
+| openclaw | Node   | 18790        | `POST /v1/chat/completions`   |
+| hermes   | Python | 18791        | `POST /webhook` *(via bridge)*|
+| custom   | —      | 42617        | `POST /webhook` (zeroclaw-style) |
+
+### zeroclaw
+
+```toml
+# ~/.zeroclaw/config.toml — bind to all interfaces, optionally turn off
+# pairing for a private LAN. Pairing on a public host: keep it on and
+# `[providers.fallback]` to a non-aliased provider id (the literal id
+# "glm" routes to the standard z.ai endpoint; use e.g. "zai" instead).
+[gateway]
+host = "0.0.0.0"
+port = 42617
+require_pairing = false
+allow_public_bind = true
+```
+
+```bash
+zeroclaw daemon   # systemd user service is the usual install path
+```
+
+### openclaw
+
+```bash
+npm install -g openclaw@latest
+
+openclaw config patch --stdin <<EOF
+{ gateway: { mode: "local", bind: "lan", port: 18790,
+             auth: { mode: "token", token: "<paste a long token here>" },
+             http: { endpoints: { chatCompletions: { enabled: true } } } } }
+EOF
+
+openclaw gateway              # foreground, or wire as a systemd unit
+```
+
+The `chatCompletions: { enabled: true }` line is what exposes
+`POST /v1/chat/completions`; without it the companion gets 404 on the
+chat call. openclaw refuses to bind to LAN without an auth token —
+paste the same token into Settings → **Pairing token**.
+
+### hermes-agent (via the bridge shim)
+
+hermes-agent doesn't ship a synchronous HTTP chat endpoint, so the
+companion talks to a tiny **HTTP → `hermes -z`** wrapper instead.
+`tools/agents/hermes-bridge.py` in this repo is the reference; it
+exposes `POST /webhook` `{message}` → `{model,response}`, the same
+shape zeroclaw uses.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+hermes setup                   # configure provider (z.ai / OpenRouter / …)
+
+# Run the bridge as a systemd user service:
+cp tools/agents/hermes-bridge.py ~/hermes-bridge.py
+cat > ~/.config/systemd/user/hermes-bridge.service <<EOF
+[Unit]
+Description=Hermes HTTP /webhook bridge (shells out to \`hermes -z\`)
+After=network.target
+
+[Service]
+Type=simple
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/hermes-bridge.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user daemon-reload
+systemctl --user enable --now hermes-bridge.service
+```
+
+Bridge tuning lives in environment variables:
+`HERMES_BRIDGE_PORT` (default 18791), `HERMES_BRIDGE_HOST` (default
+`0.0.0.0`), `HERMES_BIN` (default `~/.local/bin/hermes`),
+`HERMES_TIMEOUT` (default 180s).
+
+### Wire the companion
+
+**Settings → Main agent** on the machine running the companion:
+
+- **Agent**: pick the flavor.
+- **Gateway URL**: `http://<that-machine-ip>:<port>` — the placeholder
+  updates with the agent's default port automatically.
+- **Pairing token**: paste it (required for openclaw on LAN; optional
+  elsewhere).
+- **Request timeout**: 300s is fine; bump it if you see "timed out".
+- Click **Test connection** to verify, then **Save** → **Restart**.
+
+(You can also set these in `companion.toml` directly — `[zeroclaw]
+kind`, `url`, `pair_token`, `timeout_secs` — but the Settings page is
+the easy path.)
+
+That's it. The avatar/TTS run locally; the agent's shell, file, and
+browser tools all operate on the agent box, not on this one.
+
 ## TTS server setup
 
 The companion uses an external HTTP-port TTS process — the server in

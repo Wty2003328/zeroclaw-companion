@@ -2,14 +2,19 @@
 # Copy this to `companion.toml` next to the binary, or set
 # COMPANION_CONFIG=/abs/path/to/companion.toml.
 
-# ─── Upstream zeroclaw connection ────────────────────────────────
+# ─── Upstream agent connection ───────────────────────────────────
+# Pick the flavor — all three are pi-agent-family forks but expose
+# different chat endpoints. See README → "Running the main agent".
 [zeroclaw]
-url = "http://127.0.0.1:8080"   # where the upstream zeroclaw daemon listens
-# pair_token = "..."            # only if zeroclaw requires pairing
-# Big enough for zeroclaw's full agent loop including tool use.
-# Queries like "news about X" can fan out to 8+ web_searches and
-# easily exceed 60s. 300s default; raise further if you have tools
-# that take longer (deep crawls, long shell commands, …).
+# "zeroclaw" | "openclaw" | "hermes" | "custom"
+kind = "zeroclaw"
+# Default ports per kind: zeroclaw 42617, openclaw 18790, hermes 18791.
+url = "http://127.0.0.1:42617"
+# pair_token = "..."            # required for openclaw on LAN; optional elsewhere
+# Big enough for the agent's full tool-use loop. Queries like "news
+# about X" can fan out to 8+ web_searches and easily exceed 60s. 300s
+# default; raise further if you have long-running tools (deep crawls,
+# slow shell commands, browser automation).
 timeout_secs = 300
 
 # ─── Companion's own bind ────────────────────────────────────────

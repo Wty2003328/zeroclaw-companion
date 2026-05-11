@@ -1,16 +1,28 @@
-//! Read-only client for the upstream zeroclaw daemon.
+//! Read-only client for the upstream agent daemon.
 //!
-//! The companion talks to zeroclaw exclusively through its public HTTP +
-//! SSE surface. Two operations matter:
+//! Despite the file name (kept for back-compat), this drives any of the
+//! three pi-agent-family flavors via [`AgentKind`]:
 //!
-//! 1. [`ZeroclawClient::send_chat`] — POST `/api/chat` with a user message.
-//!    Used when the user types into the avatar UI's chat input.
-//! 2. [`ZeroclawClient::events`] — subscribe to `/api/events` SSE. Used by
-//!    the avatar pipeline to react to every agent reply that flows through
-//!    zeroclaw, regardless of which channel sourced it.
+//! - **Zeroclaw** / **Hermes** / **Custom** — `POST /webhook`
+//!   `{"message": "..."}` → `{"model","response"}`. Hermes piggy-backs
+//!   on the same shape via the bridge shim (`hermes-bridge.py`).
+//! - **Openclaw** — `POST /v1/chat/completions` (OpenAI-compatible)
+//!   `{"model":"openclaw","messages":[{...}]}` → standard OpenAI
+//!   completion. Auth is Bearer token (required for LAN binding).
 //!
-//! No fork-side code changes are needed for either; both endpoints are
-//! already shipped by upstream zeroclaw v0.7+.
+//! All flavors expose `GET /health` (no auth) so reachability checks
+//! are uniform.
+//!
+//! Two operations matter for the avatar pipeline:
+//!
+//! 1. [`ZeroclawClient::send_chat`] — turn a user message into a reply.
+//!    Dispatches by `kind`.
+//! 2. [`ZeroclawClient::events`] — subscribe to `/api/events` SSE.
+//!    Zeroclaw-only today; the other flavors don't broadcast a
+//!    comparable event stream, so the call returns an empty stream
+//!    for them. The avatar pipeline doesn't actually depend on SSE
+//!    (we drive off the synchronous chat reply), so an empty stream
+//!    is safe.
 
 use std::time::Duration;
 
@@ -18,7 +30,7 @@ use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ZeroclawConfig;
+use crate::config::{AgentKind, ZeroclawConfig};
 
 /// A typed wrapper for events the companion cares about. Zeroclaw's SSE
 /// stream carries many event types; we only surface what's actionable
@@ -45,11 +57,16 @@ pub enum AgentEvent {
     },
 }
 
-/// Client for the upstream zeroclaw HTTP gateway.
+/// Client for the upstream agent HTTP gateway.
+///
+/// Type name kept as `ZeroclawClient` for back-compat across the
+/// workspace; the actual protocol is selected per call via [`AgentKind`].
 #[derive(Clone)]
 pub struct ZeroclawClient {
+    kind: AgentKind,
     base_url: String,
     pair_token: Option<String>,
+    timeout_secs: u64,
     http: reqwest::Client,
 }
 
@@ -60,13 +77,34 @@ impl ZeroclawClient {
             .timeout(Duration::from_secs(cfg.timeout_secs))
             .build()?;
         Ok(Self {
+            kind: cfg.kind,
             base_url: cfg.url.trim_end_matches('/').to_string(),
             pair_token: cfg.pair_token.clone(),
+            timeout_secs: cfg.timeout_secs,
             http,
         })
     }
 
-    /// Health-check the upstream gateway (`GET /health`).
+    /// Which agent flavor this client drives.
+    pub fn kind(&self) -> AgentKind {
+        self.kind
+    }
+    /// The configured gateway base URL (no trailing slash).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+    /// Whether a pairing/bearer token is configured (we never expose
+    /// the token itself).
+    pub fn has_pair_token(&self) -> bool {
+        self.pair_token.is_some()
+    }
+    /// Per-request timeout in seconds.
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
+    }
+
+    /// Health-check the upstream gateway (`GET /health`). All three
+    /// flavors expose this without auth; we don't even send the bearer.
     pub async fn health(&self) -> anyhow::Result<bool> {
         let url = format!("{}/health", self.base_url);
         let resp = self.http.get(&url).send().await?;
@@ -74,15 +112,25 @@ impl ZeroclawClient {
     }
 
     /// Send a user message to the agent and return the textual reply.
-    ///
-    /// Uses zeroclaw's `POST /webhook` endpoint (verified against v0.7.5):
-    ///   request:  `{"message": "..."}`
-    ///   response: `{"model": "...", "response": "..."}`
-    ///
-    /// We tried `/api/chat` originally — it doesn't exist on v0.7.5.
-    /// `response` is the canonical key; we also accept `reply` / `text`
-    /// / `content` / `output` to be liberal across older or compat shapes.
+    /// Dispatches by `kind`.
     pub async fn send_chat(&self, message: &str) -> anyhow::Result<String> {
+        match self.kind {
+            // zeroclaw and hermes-via-bridge both speak `/webhook`
+            // {message}→{response}. "custom" defaults to the same shape
+            // so any other webhook-style endpoint Just Works.
+            AgentKind::Zeroclaw | AgentKind::Hermes | AgentKind::Custom => {
+                self.send_chat_webhook(message).await
+            }
+            // openclaw exposes an OpenAI-compatible chat-completions
+            // endpoint (we enable `gateway.http.endpoints.chatCompletions`
+            // server-side). `model:"openclaw"` is the magic string that
+            // routes to the agent rather than a raw LLM model.
+            AgentKind::Openclaw => self.send_chat_openai(message).await,
+        }
+    }
+
+    /// `POST /webhook` shape (zeroclaw + hermes bridge + custom).
+    async fn send_chat_webhook(&self, message: &str) -> anyhow::Result<String> {
         let url = format!("{}/webhook", self.base_url);
         let body = serde_json::json!({ "message": message });
         let mut req = self.http.post(&url).json(&body);
@@ -93,7 +141,10 @@ impl ZeroclawClient {
         let status = resp.status();
         if !status.is_success() {
             let txt = resp.text().await.unwrap_or_default();
-            anyhow::bail!("zeroclaw /webhook returned {status}: {txt}");
+            anyhow::bail!(
+                "{} /webhook returned {status}: {txt}",
+                self.kind.label()
+            );
         }
         let payload: serde_json::Value = resp.json().await?;
         for key in &["response", "reply", "text", "content", "output"] {
@@ -105,10 +156,61 @@ impl ZeroclawClient {
         Ok(payload.to_string())
     }
 
+    /// `POST /v1/chat/completions` OpenAI-compatible shape (openclaw).
+    async fn send_chat_openai(&self, message: &str) -> anyhow::Result<String> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        // openclaw expects model="openclaw" or "openclaw/<agentId>" —
+        // not the underlying LLM model id. That selects the agent;
+        // the LLM model is configured on the openclaw side.
+        let body = serde_json::json!({
+            "model": "openclaw",
+            "messages": [{"role": "user", "content": message}],
+        });
+        let mut req = self.http.post(&url).json(&body);
+        if let Some(ref tok) = self.pair_token {
+            req = req.bearer_auth(tok);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let txt = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "openclaw /v1/chat/completions returned {status}: {txt}"
+            );
+        }
+        let payload: serde_json::Value = resp.json().await?;
+        if let Some(s) = payload
+            .pointer("/choices/0/message/content")
+            .and_then(|v| v.as_str())
+        {
+            return Ok(s.to_string());
+        }
+        // OpenAI streaming/delta fallback shapes — unlikely without
+        // stream:true but cheap to try before giving up.
+        if let Some(s) = payload
+            .pointer("/choices/0/text")
+            .and_then(|v| v.as_str())
+        {
+            return Ok(s.to_string());
+        }
+        if let Some(arr) = payload.get("error") {
+            anyhow::bail!("openclaw error payload: {arr}");
+        }
+        Ok(payload.to_string())
+    }
+
     /// Subscribe to the upstream SSE event stream and yield typed
-    /// [`AgentEvent`]s. Reconnects are the caller's responsibility (wrap
-    /// the returned stream in your own loop with backoff).
+    /// [`AgentEvent`]s. Zeroclaw-only — the other flavors return an
+    /// empty stream because they don't expose a comparable
+    /// observability feed. The avatar pipeline doesn't depend on SSE
+    /// (we drive off the synchronous chat reply), so an empty stream
+    /// is harmless. Reconnects are the caller's responsibility.
     pub async fn events(&self) -> anyhow::Result<impl Stream<Item = AgentEvent>> {
+        if !matches!(self.kind, AgentKind::Zeroclaw | AgentKind::Custom) {
+            // Yield an empty stream — the SSE bridge in companion-server
+            // will sit idle for this kind, which is what we want.
+            return Ok(futures_util::stream::empty().left_stream());
+        }
         let url = format!("{}/api/events", self.base_url);
         let mut req = self.http.get(&url);
         if let Some(ref tok) = self.pair_token {
@@ -135,7 +237,7 @@ impl ZeroclawClient {
                 };
                 Some(classify_event(raw))
             });
-        Ok(stream)
+        Ok(stream.right_stream())
     }
 }
 

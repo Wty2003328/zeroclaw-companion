@@ -141,12 +141,17 @@ function ViewTransitionStyles() {
 }
 
 /**
- * Banner that warns the user when zeroclaw isn't running. The
- * companion app intentionally does NOT spawn or kill zeroclaw
- * (it's a separate long-lived daemon the user manages). On startup
- * we call the Tauri command `check_zeroclaw_health` (or, in browser,
- * read /api/status's zeroclaw_up field) and surface a sticky banner
- * if it's down. We re-poll every 30s in case the user starts it.
+ * Banner that warns the user when zeroclaw (the main agent) isn't
+ * reachable. The companion never spawns/kills zeroclaw — it's a
+ * separate daemon the user manages, which may live on this machine
+ * OR on a server / Raspberry Pi / laptop on the LAN.
+ *
+ * We probe `/api/status`'s `zeroclaw_up` — that's authoritative
+ * because companion-server checks zeroclaw at whatever URL is
+ * configured (local OR remote). We deliberately do NOT use the Tauri
+ * `check_zeroclaw_health` command for the banner: it defaults to
+ * `127.0.0.1:42617` when called without a URL, which would give a
+ * false "not reachable" for any remote-zeroclaw setup.
  */
 function ZeroclawHealthBanner() {
   const [healthy, setHealthy] = useState<boolean | null>(null);
@@ -155,20 +160,12 @@ function ZeroclawHealthBanner() {
   useEffect(() => {
     let cancelled = false;
     const check = async () => {
-      const inv = tauriInvoke();
       try {
+        const r = await fetch('/api/status');
         let ok = false;
-        if (inv) {
-          ok = await inv('check_zeroclaw_health', { url: '' });
-        } else {
-          // Browser fallback: companion-server's /api/status reports
-          // zeroclaw_up. May be slightly stale (last successful health
-          // call) but good enough for a non-blocking banner.
-          const r = await fetch('/api/status');
-          if (r.ok) {
-            const j = await r.json();
-            ok = !!j.zeroclaw_up;
-          }
+        if (r.ok) {
+          const j = await r.json();
+          ok = !!j.zeroclaw_up;
         }
         if (!cancelled) setHealthy(ok);
       } catch {
