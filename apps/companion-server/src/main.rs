@@ -667,6 +667,7 @@ async fn handle_get_config(
                 "streaming": cfg.subagent.streaming,
                 "llm_model": cfg.subagent.llm.model,
                 "llm_base_url": cfg.subagent.llm.base_url,
+                "llm_disable_thinking": cfg.subagent.llm.disable_thinking,
                 "timeout_secs": cfg.subagent.timeout_secs,
                 // api_key intentionally redacted
                 "llm_api_key_set": cfg.subagent.llm.api_key.is_some()
@@ -958,6 +959,9 @@ struct SubagentOverrideRequest {
     model: Option<String>,
     base_url: Option<String>,
     timeout_secs: Option<u64>,
+    /// `true` (default) → send `thinking:{type:disabled}` so GLM-family
+    /// models skip chain-of-thought; `false` → let the model reason.
+    disable_thinking: Option<bool>,
 }
 
 /// Persist the user's subagent settings choice to
@@ -1005,6 +1009,9 @@ async fn handle_post_subagent_override(
     }
     if let Some(v) = req.base_url {
         sub.base_url = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.disable_thinking {
+        sub.disable_thinking = Some(v);
     }
     if let Some(v) = req.timeout_secs {
         sub.timeout_secs = Some(v);

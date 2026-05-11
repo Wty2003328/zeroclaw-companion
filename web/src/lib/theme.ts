@@ -117,6 +117,18 @@ export function AppStyles() {
         background: rgba(59, 130, 246, 0.35);
         color: #fff;
       }
+
+      /* Pulsing dot for the "<character> is thinking…" chat indicator */
+      .ws-typing-dot {
+        width: 7px; height: 7px; border-radius: 50%;
+        background: ${tokens.primary};
+        display: inline-block; flex-shrink: 0;
+        animation: ws-typing-pulse 1.2s ease-in-out infinite;
+      }
+      @keyframes ws-typing-pulse {
+        0%, 100% { opacity: 0.3; transform: scale(0.85); }
+        50%      { opacity: 1;   transform: scale(1.1); }
+      }
     `;
     document.head.appendChild(style);
     return () => {

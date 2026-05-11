@@ -290,9 +290,11 @@ export default function Avatar() {
   // to react in real time + on the same window via custom events.
   const [installedModels, setInstalledModels] = useState<InstalledModel[]>([]);
   const [userModelId, setUserModelId] = useState<string | null>(() => getUserModelChoice());
-  // Active character's model_id (from /api/characters). Takes
-  // priority over the Settings-page manual model choice.
+  // Active character's model_id + display name (from /api/characters).
+  // model_id takes priority over the Settings-page manual model choice;
+  // the name labels the assistant's chat bubbles ("Asuna" not "companion").
   const [activeCharacterModelId, setActiveCharacterModelId] = useState<string | null>(null);
+  const [activeCharacterName, setActiveCharacterName] = useState<string | null>(null);
   useEffect(() => {
     void fetchInstalledModels().then(setInstalledModels);
     const refreshActiveCharacter = () => {
@@ -300,8 +302,9 @@ export default function Avatar() {
         .then((file) => {
           const active = file.characters.find((c) => c.id === file.active_id);
           setActiveCharacterModelId(active?.model_id || null);
+          setActiveCharacterName(active?.name?.trim() || null);
         })
-        .catch(() => setActiveCharacterModelId(null));
+        .catch(() => { setActiveCharacterModelId(null); setActiveCharacterName(null); });
     };
     refreshActiveCharacter();
     const onStorage = (e: StorageEvent) => {
@@ -1248,14 +1251,29 @@ export default function Avatar() {
             overscrollBehavior: 'contain',
           }}
         >
-          {history.length === 0 && (
+          {history.length === 0 && !sending && (
             <div style={{ color: '#666', fontSize: 13, textAlign: 'center', marginTop: 32 }}>
-              No messages yet. Type below to start.
+              No messages yet. Type below to start{activeCharacterName ? ` chatting with ${activeCharacterName}` : ''}.
             </div>
           )}
           {history.map((turn, i) => (
-            <ChatBubble key={`${turn.ts}-${i}`} turn={turn} />
+            <ChatBubble key={`${turn.ts}-${i}`} turn={turn} speakerName={activeCharacterName} />
           ))}
+          {sending && (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 2, contain: 'content' }}>
+              <div style={{ fontSize: 10, color: '#666', padding: '0 4px' }}>
+                {activeCharacterName ?? 'companion'}
+              </div>
+              <div style={{
+                background: '#1a1d22', borderRadius: 12, padding: '10px 14px',
+                color: '#888', fontSize: 13, fontStyle: 'italic',
+                display: 'inline-flex', alignItems: 'center', gap: 8,
+              }}>
+                <span className="ws-typing-dot" />
+                {activeCharacterName ?? 'Asuna'} is thinking…
+              </div>
+            </div>
+          )}
         </div>
 
         <div style={{ padding: 12, borderTop: '1px solid #1f2227' }}>
@@ -1406,7 +1424,7 @@ export default function Avatar() {
   );
 }
 
-function ChatBubble({ turn }: { turn: ChatTurn }) {
+function ChatBubble({ turn, speakerName }: { turn: ChatTurn; speakerName?: string | null }) {
   const isUser = turn.role === 'user';
   const [showDetails, setShowDetails] = useState(false);
   const hasDetails = !isUser && !!turn.debug;
@@ -1425,7 +1443,7 @@ function ChatBubble({ turn }: { turn: ChatTurn }) {
       }}
     >
       <div style={{ fontSize: 10, color: '#666', padding: '0 4px' }}>
-        {isUser ? 'you' : 'companion'} · {fmtTime(turn.ts)}
+        {isUser ? 'you' : (speakerName ?? 'companion')} · {fmtTime(turn.ts)}
         {hasDetails && (
           <button
             type="button"

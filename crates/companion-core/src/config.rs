@@ -280,6 +280,12 @@ pub struct SubagentOverride {
     /// Subagent timeout in seconds (covers the whole LLM call).
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Whether to send `thinking: { type: "disabled" }` on the direct-
+    /// LLM call. `true` (default) = faster, no chain-of-thought;
+    /// `false` = let the model reason (richer output, slower). Maps to
+    /// `[avatar.subagent.llm] disable_thinking`.
+    #[serde(default)]
+    pub disable_thinking: Option<bool>,
 }
 
 impl RuntimeOverride {
@@ -387,7 +393,11 @@ impl RuntimeOverride {
                 );
             }
             // LLM nested table.
-            if s.api_key.is_some() || s.model.is_some() || s.base_url.is_some() {
+            if s.api_key.is_some()
+                || s.model.is_some()
+                || s.base_url.is_some()
+                || s.disable_thinking.is_some()
+            {
                 let llm = sub_obj
                     .entry("llm")
                     .or_insert_with(|| serde_json::json!({}));
@@ -403,6 +413,9 @@ impl RuntimeOverride {
                 }
                 if let Some(ref v) = s.base_url {
                     llm_obj.insert("base_url".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(v) = s.disable_thinking {
+                    llm_obj.insert("disable_thinking".into(), serde_json::Value::Bool(v));
                 }
             }
         }

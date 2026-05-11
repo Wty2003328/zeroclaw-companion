@@ -42,6 +42,7 @@ interface AvatarConfigView {
     streaming: boolean;
     llm_model: string;
     llm_base_url: string;
+    llm_disable_thinking: boolean;
     llm_api_key_set: boolean;
     timeout_secs: number;
   };
@@ -201,37 +202,36 @@ export default function Settings() {
         )}
       </Section>
 
-      {/* Advanced — companion-service URL. Most users never touch this.
-          It controls where the React app reaches its own background
-          service; typing the agent URL here by mistake breaks all the
-          sections above. Tucked under a disclosure to make that hard. */}
-      <section style={{
-        marginTop: 24, padding: '4px 22px', borderRadius: tokens.radius,
-      }}>
-        <AdvancedDisclosure label="Advanced — companion service URL">
-          <p style={{ margin: '0 0 8px 0', fontSize: 12.5, color: tokens.textMuted, lineHeight: 1.55 }}>
-            Where this UI reaches the local background service (the
-            <code>companion-server</code> sidecar). Leave empty for the
-            default. <strong>Not</strong> the agent address — set that in
-            <em> Main agent</em> above.
-          </p>
-          <Row>
-            <input
-              type="text"
-              value={serverInput}
-              onChange={(e) => setServerInput(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && handleSaveUrl()}
-              placeholder={`${getDefaultServerUrl()}  (default)`}
-              style={monoInputStyle}
-            />
-            <Button onClick={handleSaveUrl} primary>Save</Button>
-            <Button onClick={handleClearUrl} disabled={isUsingDefaultUrl}>Reset</Button>
-          </Row>
-          <Hint tone={savedHint ? 'good' : 'muted'}>
-            {savedHint ?? `Now using: ${getServerUrl()}${isUsingDefaultUrl ? ' (default)' : ''}`}
-          </Hint>
-        </AdvancedDisclosure>
-      </section>
+      {/* Companion service URL — most users never touch this. It's the
+          address the React UI uses to reach its own background service
+          (the companion-server sidecar). Distinct from the agent URL
+          above; the description spells that out so it doesn't get
+          confused with it. */}
+      <Section
+        title="Companion service"
+        description="Where this UI reaches its local background service (the companion-server sidecar). Leave blank for the default — this is not the agent address; set that in Main agent above."
+      >
+        <FieldRow
+          label="Service URL"
+          hint={`Now using: ${getServerUrl()}${isUsingDefaultUrl ? ' (default)' : ''}`}
+        >
+          <input
+            type="text"
+            value={serverInput}
+            onChange={(e) => setServerInput(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && handleSaveUrl()}
+            placeholder={`${getDefaultServerUrl()}  (default)`}
+            style={monoInputStyle}
+          />
+          <Button onClick={handleSaveUrl} primary>Save</Button>
+          <Button onClick={handleClearUrl} disabled={isUsingDefaultUrl}>Reset</Button>
+        </FieldRow>
+        {savedHint && (
+          <div style={{ marginTop: 8 }}>
+            <Hint tone="good">{savedHint}</Hint>
+          </div>
+        )}
+      </Section>
       </div>
     </div>
   );
@@ -734,7 +734,7 @@ function AvatarEditor({
         </div>
       </FieldRow>
 
-      <AdvancedDisclosure label="Advanced — voice engine">
+      <Subsection label="Voice engine">
         <FieldRow label="Voice engine">
           <select
             value={isCustomEngine ? '__custom' : ttsEngine}
@@ -963,7 +963,7 @@ function AvatarEditor({
           The avatar's Live2D model and default expression are set
           per-character on the <a href="/" style={{ color: '#7aa9ff' }}>Home page</a>.
         </div>
-      </AdvancedDisclosure>
+      </Subsection>
 
       <EditorFooter
         status={
@@ -1003,6 +1003,9 @@ function SubagentEditor({
   const [apiKey, setApiKey] = useState<string>('');
   const [model, setModel] = useState<string>(current.llm_model || '');
   const [baseUrl, setBaseUrl] = useState<string>(current.llm_base_url || '');
+  // `current.llm_disable_thinking` may be undefined on older server
+  // builds — default to true (the historical hardcoded behavior).
+  const [disableThinking, setDisableThinking] = useState<boolean>(current.llm_disable_thinking ?? true);
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1015,7 +1018,8 @@ function SubagentEditor({
     backend !== (current.use_zeroclaw_webhook ? 'webhook' : 'direct') ||
     apiKey.length > 0 ||
     model.trim() !== (current.llm_model || '') ||
-    baseUrl.trim() !== (current.llm_base_url || '');
+    baseUrl.trim() !== (current.llm_base_url || '') ||
+    disableThinking !== (current.llm_disable_thinking ?? true);
 
   const save = async () => {
     setSaving(true); setError(null);
@@ -1044,6 +1048,7 @@ function SubagentEditor({
       if (apiKey.length > 0) subBody.api_key = apiKey;
       if (model.trim() !== (current.llm_model || '')) subBody.model = model.trim();
       if (baseUrl.trim() !== (current.llm_base_url || '')) subBody.base_url = baseUrl.trim();
+      if (disableThinking !== (current.llm_disable_thinking ?? true)) subBody.disable_thinking = disableThinking;
       if (timeout !== current.timeout_secs) subBody.timeout_secs = timeout;
       if (Object.keys(subBody).length) {
         const r = await fetch(`${HTTP_BASE}/api/config/subagent`, {
@@ -1103,32 +1108,45 @@ function SubagentEditor({
       </div>
 
       {backend === 'direct' && (
-        <AdvancedDisclosure label="AI service details">
+        <Subsection label="AI service">
           <FieldRow label="API endpoint">
             <input type="text" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}
-              placeholder="https://api.openai.com/v1" style={inputStyle} />
+              placeholder="https://api.openai.com/v1" style={monoInputStyle} />
           </FieldRow>
           <FieldRow label="Model name">
             <input type="text" value={model} onChange={(e) => setModel(e.target.value)}
-              placeholder="gpt-4o-mini" style={inputStyle} />
+              placeholder="gpt-4o-mini" style={monoInputStyle} />
           </FieldRow>
-          <FieldRow label="API key">
+          <FieldRow
+            label="API key"
+            hint="Saved on this computer only (companion.runtime.json). Keep that file out of git."
+          >
             <input
               type="password"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
               placeholder={current.llm_api_key_set ? '••• saved (paste to replace)' : 'paste your OpenAI / z.ai / etc. key'}
-              style={inputStyle}
+              style={monoInputStyle}
               autoComplete="off"
             />
           </FieldRow>
-          <div style={{ fontSize: 11, color: '#666', marginLeft: 168 }}>
-            Saved on this computer only. Keep this file out of git.
-          </div>
-        </AdvancedDisclosure>
+          <FieldRow
+            label="Model reasoning"
+            hint={disableThinking
+              ? 'Off — sends thinking:{type:disabled}. GLM-4.5/4.6/5 family skip chain-of-thought (~1 s vs ~15–25 s). Other endpoints ignore the flag.'
+              : 'On — the model reasons before answering. Slower, but better translation/expression picks on tricky inputs.'}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Toggle checked={!disableThinking} onChange={(on) => setDisableThinking(!on)} />
+              <span style={{ fontSize: 12, color: tokens.textMuted }}>
+                {disableThinking ? 'off (fast)' : 'on (slower, richer)'}
+              </span>
+            </div>
+          </FieldRow>
+        </Subsection>
       )}
 
-      <AdvancedDisclosure label="Advanced — timing & streaming">
+      <Subsection label="Timing & streaming">
         <FieldRow label="Time limit (seconds)">
           <input
             type="number" min={5} max={300}
@@ -1157,7 +1175,7 @@ function SubagentEditor({
           With "Through main agent" it falls back to the non-streaming
           path automatically.
         </div>
-      </AdvancedDisclosure>
+      </Subsection>
 
       <EditorFooter
         status={
@@ -1314,32 +1332,28 @@ function SubagentSpeedupHint({ onDismiss }: { onDismiss: () => void }) {
   );
 }
 
-/** Collapsible "Advanced" section. Closed by default; opens to reveal
- *  the technical knobs that most users won't touch. Keeps the main
- *  settings page short and approachable for first-time users while
- *  still letting power users get to everything. */
-function AdvancedDisclosure({
+/** A labelled subsection within a Section. Renders the children
+ *  inline (always visible — no click-to-expand) under a small caps
+ *  header with a divider above, so related controls stay grouped
+ *  without hiding anything behind a disclosure. */
+function Subsection({
   label, children,
 }: { label: string; children: React.ReactNode }) {
-  const [open, setOpen] = useState(false);
   return (
-    <div style={{ marginTop: 4 }}>
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        style={{
-          width: '100%', display: 'flex', alignItems: 'center', gap: 8,
-          padding: '8px 0', background: 'transparent', border: 'none',
-          color: '#7aa9ff', fontSize: 12, cursor: 'pointer', textAlign: 'left',
-        }}
-        aria-expanded={open}
-      >
-        <span style={{ fontSize: 10, color: '#666', width: 10, textAlign: 'center' }}>
-          {open ? '▾' : '▸'}
-        </span>
-        {label}
-      </button>
-      {open && <div style={{ paddingLeft: 18, paddingBottom: 8 }}>{children}</div>}
+    <div style={{
+      marginTop: 18,
+      paddingTop: 14,
+      borderTop: `1px solid ${tokens.border}`,
+    }}>
+      <div style={{
+        fontSize: 11,
+        fontWeight: 600,
+        letterSpacing: '0.06em',
+        textTransform: 'uppercase',
+        color: tokens.textDim,
+        marginBottom: 10,
+      }}>{label}</div>
+      {children}
     </div>
   );
 }

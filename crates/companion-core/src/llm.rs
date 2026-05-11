@@ -44,6 +44,15 @@ pub struct LlmConfig {
     /// Per-request timeout in seconds.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Whether to send `thinking: { type: "disabled" }` in the request
+    /// body. z.ai's GLM-4.5/4.6/5 family otherwise spends 15–25 s in
+    /// chain-of-thought before producing the actual JSON the subagent
+    /// needs; disabling it cuts that to ~1 s. Other OpenAI-compatible
+    /// endpoints ignore the field. Default `true` (faster). Set `false`
+    /// if you want the model's full reasoning (better translation /
+    /// expression quality on hard inputs, at the cost of latency).
+    #[serde(default = "default_disable_thinking")]
+    pub disable_thinking: bool,
 }
 
 fn default_base_url() -> String {
@@ -58,6 +67,9 @@ fn default_max_tokens() -> u32 {
 fn default_timeout() -> u64 {
     30
 }
+fn default_disable_thinking() -> bool {
+    true
+}
 
 impl Default for LlmConfig {
     fn default() -> Self {
@@ -69,6 +81,7 @@ impl Default for LlmConfig {
             temperature: default_temperature(),
             max_tokens: default_max_tokens(),
             timeout_secs: default_timeout(),
+            disable_thinking: default_disable_thinking(),
         }
     }
 }
@@ -97,6 +110,7 @@ pub struct LlmClient {
     model: String,
     temperature: f32,
     max_tokens: u32,
+    disable_thinking: bool,
     http: reqwest::Client,
 }
 
@@ -112,6 +126,7 @@ impl LlmClient {
             model: cfg.model.clone(),
             temperature: cfg.temperature,
             max_tokens: cfg.max_tokens,
+            disable_thinking: cfg.disable_thinking,
             http,
         })
     }
@@ -120,20 +135,20 @@ impl LlmClient {
     pub async fn chat(&self, messages: &[ChatMessage]) -> anyhow::Result<String> {
         let url = format!("{}/chat/completions", self.base_url);
         // `thinking: { type: disabled }` is z.ai's switch to skip the
-        // reasoning_content step on GLM-4.5 family models. Without it,
-        // glm-4.5-flash sits in chain-of-thought for 15–25 seconds
-        // before producing the actual JSON the subagent needs (verified
-        // direct: 22s with thinking on vs ~1s with it off). Other
-        // OpenAI-compatible endpoints either ignore unknown fields
-        // (OpenAI / Groq / DeepSeek) or accept it as a no-op, so we
-        // send it unconditionally — saves the user a config knob.
-        let body = serde_json::json!({
+        // reasoning_content step on GLM-4.5/4.6/5 family models. Without
+        // it, those models sit in chain-of-thought for 15–25 s before
+        // producing the JSON the subagent needs. Other OpenAI-compatible
+        // endpoints ignore the field. Gated by `disable_thinking` so the
+        // user can re-enable reasoning if they want richer output.
+        let mut body = serde_json::json!({
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
-            "thinking": { "type": "disabled" },
         });
+        if self.disable_thinking {
+            body["thinking"] = serde_json::json!({ "type": "disabled" });
+        }
         let mut req = self.http.post(&url).json(&body);
         if let Some(ref key) = self.api_key {
             req = req.bearer_auth(key);
@@ -178,14 +193,16 @@ impl LlmClient {
     {
         use futures_util::StreamExt;
         let url = format!("{}/chat/completions", self.base_url);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "stream": true,
-            "thinking": { "type": "disabled" },
         });
+        if self.disable_thinking {
+            body["thinking"] = serde_json::json!({ "type": "disabled" });
+        }
         let mut req = self.http.post(&url).json(&body);
         if let Some(ref key) = self.api_key {
             req = req.bearer_auth(key);
