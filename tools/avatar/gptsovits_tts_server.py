@@ -493,12 +493,203 @@ ref_mel = _ref_mel(REF_WAV)
 
 
 # ---------------------------------------------------------------------------
-# Inference. Returns 48 kHz float32 mono waveform.
+# Text segmentation for synthesis.
+#
+# GPT-SoVITS' AR (text→semantic) model is trained on single utterances. Feed
+# it a whole multi-sentence reply in one shot and it frequently predicts the
+# end-of-sequence token early — you get audio for ~the first sentence and the
+# rest is silently dropped (users hear "she only said 4 words"). A stray ASCII
+# digit or unusual symbol makes it worse. The official GPT-SoVITS UI avoids
+# this by *cutting* the text into short segments, synthesizing each, and
+# concatenating the audio — this wrapper didn't, so we add it here.
+#
+# But cutting per *single* sentence hurts prosody — the model gives noticeably
+# smoother inter-sentence rhythm with a few sentences of context. So we cut
+# into ~2-3-sentence segments (lang-aware char target) and rely on the re-roll
+# in _synthesize_robust to catch the occasional early-stop. A runaway
+# terminator-less "sentence" is sub-split on commas; failing that, hard-cut.
 # ---------------------------------------------------------------------------
+
+# Sentence terminators (CJK + ASCII). `\n` is treated as a hard break too.
+_SENT_END = set("。！？!?…．")
+# Trailing punctuation that should ride along on the segment that precedes it
+# (a closing quote/paren or a 長音符 after a "？" belongs to that sentence).
+_TRAILERS = set("\"'）)]}」』】〉》”’～~ ")
+# Soft break points to fall back on inside an over-long, terminator-less run.
+_SOFT_BREAK = set("、，,；;：:")
+# A "sentence" longer than this with no terminator is pathological — force a
+# break (on a comma if there is one, else hard) so the AR model never sees a
+# giant run.
+_HARD_SENTENCE_CAP = 90
+# Target / hard-cap chars per AR-model segment (≈ 2-3 sentences). CJK is ~2x
+# denser than latin, so the budgets differ by language.
+SEG_TARGET_CHARS_CJK = 36
+SEG_MAX_CHARS_CJK = 70
+SEG_TARGET_CHARS_LATIN = 120
+SEG_MAX_CHARS_LATIN = 240
+# Tiny silence between concatenated segments so they don't sound jammed
+# together. 0.10 s ≈ a natural inter-sentence micro-pause.
+SEG_GAP_SECONDS = 0.10
+
+
+def _has_speakable(s: str) -> bool:
+    """True if `s` has at least one letter/digit/CJK char (vs. pure punctuation)."""
+    return any(c.isalnum() or "぀" <= c <= "ヿ" or "一" <= c <= "鿿"
+               for c in s)
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split `text` into individual sentences (terminator kept attached;
+    pure-punctuation fragments dropped)."""
+    text = text.strip()
+    if not text:
+        return []
+    out: list[str] = []
+    buf: list[str] = []
+    pending_cut = False  # saw a terminator; cut once trailers stop coming
+
+    def flush():
+        nonlocal pending_cut
+        pending_cut = False
+        s = "".join(buf).strip()
+        buf.clear()
+        if s and _has_speakable(s):
+            out.append(s)
+
+    last_soft = -1  # len(buf) just after the most recent soft-break char
+    for ch in text:
+        if ch == "\n":
+            flush()
+            last_soft = -1
+            continue
+        if pending_cut and ch not in _TRAILERS and ch not in _SENT_END:
+            flush()  # the previous sentence + its trailers / extra ？！ end here
+            last_soft = -1
+        buf.append(ch)
+        if ch in _SOFT_BREAK:
+            last_soft = len(buf)
+        if ch in _SENT_END:
+            pending_cut = True
+        elif len(buf) >= _HARD_SENTENCE_CAP and not pending_cut:
+            # Over-long with no terminator in sight: prefer the last soft
+            # break, else hard-cut here.
+            if 0 < last_soft < len(buf):
+                head, tail = buf[:last_soft], buf[last_soft:]
+                buf[:] = head
+                flush()
+                buf.extend(tail)
+            else:
+                flush()
+            last_soft = -1
+    flush()
+    return out
+
+
+def _split_for_tts(text: str, lang: str) -> list[str]:
+    """Split into AR-model segments of ~2-3 sentences each (one /tts call's
+    text typically becomes one segment). Smoother prosody than one-sentence
+    cuts; the re-roll in _synthesize_robust covers the rare early-stop."""
+    sentences = _split_sentences(text)
+    if not sentences:
+        return []
+    cjk = lang in ("ja", "zh")
+    target = SEG_TARGET_CHARS_CJK if cjk else SEG_TARGET_CHARS_LATIN
+    hard = SEG_MAX_CHARS_CJK if cjk else SEG_MAX_CHARS_LATIN
+    segs: list[str] = []
+    cur = ""
+    for s in sentences:
+        if not cur:
+            cur = s
+        elif len(cur) >= target or len(cur) + 1 + len(s) > hard:
+            segs.append(cur)
+            cur = s
+        else:
+            cur = f"{cur} {s}"
+    if cur:
+        segs.append(cur)
+    return segs
+
+
+# ---------------------------------------------------------------------------
+# Inference. Returns 48 kHz float32 mono waveform.
+#
+# GPT-SoVITS' AR model samples (top_k + temperature) → it's stochastic, and on
+# short Japanese sentences it sometimes rolls an early end-of-sequence token,
+# producing audio for only the first few words. We can't eliminate that without
+# changing sampling params (which would touch voice quality), so instead we
+# *detect* it — a segment whose audio is way shorter than its char count would
+# suggest — and re-roll. Re-rolling is cheap (~1-2 s) and almost always lands a
+# complete take. A genuinely-consistent failure (3 short rolls) at least keeps
+# the longest attempt, and the *other* segments are unaffected.
+# ---------------------------------------------------------------------------
+
+# Conservative lower-bound speaking rate: ~9.5 CJK char/s, ~19 latin char/s.
+# A real take is comfortably above char_count * rate; a truncated one isn't.
+_CJK_SECS_PER_CHAR = 0.105
+_LATIN_SECS_PER_CHAR = 0.052
+# One re-roll is enough: early-stop is stochastic, so a second sample almost
+# always lands a complete take. Two re-rolls would just add ~1.5 s of latency
+# for the rare double-bad-roll without meaningfully improving reliability.
+MAX_SYNTH_RETRIES = 1
+
+
+def _has_cjk(s: str) -> bool:
+    return any("぀" <= c <= "ヿ" or "一" <= c <= "鿿" for c in s)
+
+
+def _expected_min_secs(seg: str) -> float:
+    return len(seg) * (_CJK_SECS_PER_CHAR if _has_cjk(seg) else _LATIN_SECS_PER_CHAR)
+
+
+def _synthesize_robust(seg: str, lang: str, idx: int, total: int,
+                       top_k: int, temperature: float, sample_steps: int) -> np.ndarray:
+    """Synthesize one segment, re-rolling if the AR model stopped early."""
+    best = np.zeros(0, dtype=np.float32)
+    floor = max(0.7, 0.55 * _expected_min_secs(seg))  # min plausible duration
+    for attempt in range(MAX_SYNTH_RETRIES + 1):
+        try:
+            a = _synthesize_segment(seg, lang, top_k, temperature, sample_steps)
+        except Exception as e:  # one bad roll shouldn't kill the whole reply
+            print(f"[gpt-sovits-tts] seg {idx + 1}/{total} attempt {attempt + 1} crashed: {e!r}")
+            continue
+        if a.size > best.size:
+            best = a
+        secs = a.size / SAMPLE_RATE
+        if len(seg) < 6 or secs >= floor:
+            return best  # plausible length (or too short to judge) — done
+        if attempt < MAX_SYNTH_RETRIES:
+            print(f"[gpt-sovits-tts] seg {idx + 1}/{total} short ({secs:.2f}s vs "
+                  f">{floor:.2f}s expected for {len(seg)}ch) — re-rolling")
+    return best
 
 
 def synthesize(text: str, lang: str, top_k: int = 15, temperature: float = 1.0,
                sample_steps: int = 32) -> np.ndarray:
+    """Synthesize `text`: split into ~2-3-sentence AR-safe segments,
+    synthesize (with re-roll on early-stop) each, concatenate. 48 kHz mono
+    float32. Empty / unspeakable input → empty array (the /tts handler guards)."""
+    segments = _split_for_tts(text, lang)
+    if not segments:
+        return np.zeros(0, dtype=np.float32)
+
+    gap = np.zeros(int(SAMPLE_RATE * SEG_GAP_SECONDS), dtype=np.float32)
+    pieces: list[np.ndarray] = []
+    for i, seg in enumerate(segments):
+        a = _synthesize_robust(seg, lang, i, len(segments), top_k, temperature, sample_steps)
+        if a.size == 0:
+            continue
+        if pieces:
+            pieces.append(gap)
+        pieces.append(a)
+    if not pieces:
+        return np.zeros(0, dtype=np.float32)
+    if len(pieces) == 1:
+        return pieces[0]
+    return np.concatenate(pieces).astype(np.float32)
+
+
+def _synthesize_segment(text: str, lang: str, top_k: int = 15, temperature: float = 1.0,
+                        sample_steps: int = 32) -> np.ndarray:
     phone_ids, w2p, norm = _phoneme_ids(text, lang)
     bert_feat = _bert_for(phone_ids, w2p, norm, lang)
     all_phone_ids = torch.LongTensor(phone_ids).unsqueeze(0).to(DEVICE)
@@ -619,9 +810,10 @@ async def tts(req: TtsRequest):
 
     wav = _wav_bytes(audio, SAMPLE_RATE)
     duration = len(audio) / SAMPLE_RATE
+    nsegs = len(_split_for_tts(req.text, req.language))
     print(
         f"[gpt-sovits-tts] /tts lang={req.language} chars={len(req.text)} "
-        f"audio={duration:.2f}s wall={time.time() - t0:.2f}s"
+        f"segs={nsegs} audio={duration:.2f}s wall={time.time() - t0:.2f}s"
     )
     return Response(
         content=wav,

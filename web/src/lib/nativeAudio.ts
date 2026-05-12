@@ -35,15 +35,20 @@ export function nativeAudioAvailable(): boolean {
  *  All chunks of the same `turnId` queue into one continuous sink.
  *  `seq` is the 0-based chunk index — the rodio worker drops repeats
  *  of the same (turnId, seq) so we don't double-play when the avatar
- *  overlay window AND the main window both receive the broadcast. */
+ *  overlay window AND the main window both receive the broadcast.
+ *  `last` flags the turn's final chunk so the worker's jitter buffer
+ *  can start a short reply immediately instead of waiting for more.
+ *  An empty `audioB64` with `last=true` is the end-of-turn terminator
+ *  (no trailing audio) — forward it so the worker flushes + finishes. */
 export async function playAudioNative(
   audioB64: string,
   turnId: string,
   seq: number,
+  last: boolean,
 ): Promise<void> {
   const invoke = tauriInvoke();
   if (!invoke) throw new Error('not running under Tauri');
-  await invoke('play_audio_native', { audioB64, turnId, seq });
+  await invoke('play_audio_native', { audioB64, turnId, seq, last });
 }
 
 /** Interrupt any in-flight native playback (drops the queue). */

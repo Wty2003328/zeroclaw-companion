@@ -690,23 +690,16 @@ async fn run_streaming_speak(
     let turn_id = uuid::Uuid::new_v4().to_string();
     let min_len = state.config.load().tts.streaming_min_chars;
 
-    // Send initial frames: expression + subtitle text + debug. The
-    // chat bubble shows immediately; audio follows as TTS produces it.
     let bcast = |frame: AvatarNotification| {
         let _ = state.event_tx.send(AvatarEvent::Frame(frame));
     };
-    bcast(AvatarNotification::Expression {
-        name: keyword_expr.name.clone(),
-        intensity: keyword_expr.intensity,
-        duration_ms: None,
-    });
-    bcast(AvatarNotification::Text { content: subtitle_text.clone() });
-    bcast(AvatarNotification::Debug {
-        chat_text: subtitle_text.clone(),
-        spoken_text: String::new(),
-        expression: keyword_expr.name.clone(),
-        subagent_used: true,
-    });
+
+    // NOTE: the "intro" frames (Expression + Text + Debug) are NOT sent
+    // up front. They're emitted by the dispatcher task immediately before
+    // the *first* Audio frame leaves — so the chat-bubble / subtitle land
+    // *with* the sound instead of ~10-20s ahead of it (the agent reply
+    // returns long before TTS produces audio). The frontend's HTTP
+    // fallback (handleSendChat) still backstops a dropped WS connection.
 
     // Channel: (sentence_text, is_final). is_final marks the last
     // sentence so the dispatcher knows to stamp the Audio frame's
@@ -716,8 +709,57 @@ async fn run_streaming_speak(
     let dispatcher_state = state.clone();
     let dispatcher_lang = tts_lang.to_string();
     let dispatcher_turn = turn_id.clone();
+    let dispatcher_subtitle = subtitle_text.clone();
+    let dispatcher_expr_name = keyword_expr.name.clone();
+    let dispatcher_expr_intensity = keyword_expr.intensity;
     let dispatcher = tokio::spawn(async move {
         let mut seq: u32 = 0;
+        let mut intro_sent = false;
+        // Expression + chat-bubble text + (empty) debug, exactly once,
+        // just before the first Audio frame — keeps text synced to sound.
+        macro_rules! emit_intro_once {
+            () => {{
+                if !intro_sent {
+                    intro_sent = true;
+                    let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
+                        AvatarNotification::Expression {
+                            name: dispatcher_expr_name.clone(),
+                            intensity: dispatcher_expr_intensity,
+                            duration_ms: None,
+                        },
+                    ));
+                    let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
+                        AvatarNotification::Text { content: dispatcher_subtitle.clone() },
+                    ));
+                    let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
+                        AvatarNotification::Debug {
+                            chat_text: dispatcher_subtitle.clone(),
+                            spoken_text: String::new(),
+                            expression: dispatcher_expr_name.clone(),
+                            subagent_used: true,
+                        },
+                    ));
+                }
+            }};
+        }
+        macro_rules! send_empty_terminator {
+            () => {
+                let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
+                    AvatarNotification::Audio {
+                        audio: String::new(),
+                        format: "wav".into(),
+                        sample_rate: 0,
+                        lip_sync: crate::protocol::LipSyncDataProto {
+                            frames: Vec::new(),
+                            frame_duration_ms: 30,
+                        },
+                        turn_id: dispatcher_turn.clone(),
+                        seq,
+                        last: true,
+                    },
+                ));
+            };
+        }
         while let Some((sentence_opt, is_final)) = rx.recv().await {
             let cleaned: String = match sentence_opt {
                 Some(s) => strip_emoji_and_markdown_for_tts(&s),
@@ -725,22 +767,11 @@ async fn run_streaming_speak(
             };
             if cleaned.trim().is_empty() {
                 if is_final {
-                    // Empty-tail terminator so the frontend can
-                    // clear "speaking" state without an audio chunk.
-                    let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
-                        AvatarNotification::Audio {
-                            audio: String::new(),
-                            format: "wav".into(),
-                            sample_rate: 0,
-                            lip_sync: crate::protocol::LipSyncDataProto {
-                                frames: Vec::new(),
-                                frame_duration_ms: 30,
-                            },
-                            turn_id: dispatcher_turn.clone(),
-                            seq,
-                            last: true,
-                        },
-                    ));
+                    // No more audio coming — still surface the reply text
+                    // (even if TTS produced nothing), then close the turn
+                    // so the frontend can drop "speaking" state.
+                    emit_intro_once!();
+                    send_empty_terminator!();
                     break;
                 } else {
                     continue;
@@ -759,6 +790,7 @@ async fn run_streaming_speak(
                     use base64::Engine;
                     let audio_b64 = base64::engine::general_purpose::STANDARD
                         .encode(&audio.audio_bytes);
+                    emit_intro_once!(); // text rides just ahead of the first chunk
                     let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
                         AvatarNotification::Audio {
                             audio: audio_b64,
@@ -779,20 +811,8 @@ async fn run_streaming_speak(
                         "avatar: streaming TTS failed for chunk seq={seq}: {e}"
                     );
                     if is_final {
-                        let _ = dispatcher_state.event_tx.send(AvatarEvent::Frame(
-                            AvatarNotification::Audio {
-                                audio: String::new(),
-                                format: "wav".into(),
-                                sample_rate: 0,
-                                lip_sync: crate::protocol::LipSyncDataProto {
-                                    frames: Vec::new(),
-                                    frame_duration_ms: 30,
-                                },
-                                turn_id: dispatcher_turn.clone(),
-                                seq,
-                                last: true,
-                            },
-                        ));
+                        emit_intro_once!();
+                        send_empty_terminator!();
                     }
                 }
             }
@@ -800,6 +820,13 @@ async fn run_streaming_speak(
             if is_final {
                 break;
             }
+        }
+        // Safety net: if the channel closed without ever delivering a
+        // usable sentence (shouldn't happen), still surface the reply and
+        // close the turn so the frontend doesn't hang in "speaking".
+        if !intro_sent {
+            emit_intro_once!();
+            send_empty_terminator!();
         }
     });
 

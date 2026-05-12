@@ -33,6 +33,12 @@ enum AudioCmd {
         /// would play it twice — the symptom users heard as "she said
         /// the sentence twice").
         seq: u32,
+        /// True on the final chunk of the turn (the producer marks the
+        /// last sentence, or sends an empty-bytes terminator with this
+        /// set). Lets the jitter buffer start playing a short reply
+        /// immediately instead of waiting for a second chunk that will
+        /// never come.
+        last: bool,
     },
     Stop,
 }
@@ -51,7 +57,79 @@ impl AudioState {
     }
 }
 
+/// Decode a WAV blob and append it to the sink. Returns whether the
+/// sink had run dry *before* this chunk landed (i.e. an audible gap
+/// just occurred) — informational only.
+fn append_wav(sink: &rodio::Sink, wav_bytes: Vec<u8>, turn_id: &str, seq: u32) -> bool {
+    let bytes_len = wav_bytes.len();
+    let underran = sink.empty();
+    match rodio::Decoder::new_wav(std::io::Cursor::new(wav_bytes)) {
+        Ok(source) => {
+            sink.append(source);
+            tracing::info!(
+                "companion-audio: queued chunk turn={turn_id} seq={seq} bytes={bytes_len} sink_len={}",
+                sink.len(),
+            );
+        }
+        Err(e) => tracing::warn!("companion-audio: wav decode (turn={turn_id} seq={seq}): {e}"),
+    }
+    underran
+}
+
+/// Rough wall-seconds of audio in a WAV blob, from the format header
+/// (`byte_rate` at offset 28) and the `data` chunk size. Used to decide
+/// when the streaming prebuffer holds "enough" to start playing without
+/// risking a mid-reply gap. Falls back to a 48 kHz / mono / 16-bit
+/// estimate if the header doesn't parse — the value only needs to be a
+/// monotonic-in-duration proxy, not exact.
+fn wav_secs(b: &[u8]) -> f32 {
+    let approx = || (b.len().saturating_sub(44)) as f32 / 96_000.0;
+    if b.len() < 44 || &b[0..4] != b"RIFF" || &b[8..12] != b"WAVE" {
+        return approx();
+    }
+    let byte_rate = u32::from_le_bytes([b[28], b[29], b[30], b[31]]) as f32;
+    if byte_rate < 1.0 {
+        return approx();
+    }
+    // Walk the chunk list for `data`.
+    let mut pos = 12usize;
+    while pos + 8 <= b.len() {
+        let id = &b[pos..pos + 4];
+        let sz = u32::from_le_bytes([b[pos + 4], b[pos + 5], b[pos + 6], b[pos + 7]]) as usize;
+        if id == b"data" {
+            let actual = sz.min(b.len().saturating_sub(pos + 8));
+            return actual as f32 / byte_rate;
+        }
+        pos += 8 + sz + (sz & 1); // chunks are word-aligned
+    }
+    approx()
+}
+
 fn run_audio_worker(rx: std::sync::mpsc::Receiver<AudioCmd>) {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::{Duration, Instant};
+
+    // Streaming jitter buffer. The producer streams ~2-3-sentence chunks
+    // (each /tts call ≈ one AR-model call, ≈ ~5-8 s of audio produced in
+    // ~3-5 s). The one place a gap can open is the *start* of a turn — if
+    // chunk 0's audio runs out before chunk 1 lands (an unusually short
+    // opening chunk, or a brief cloud-LLM stall mid-stream). So we hold the
+    // opening chunk(s) in `pending` and don't start feeding the Sink until
+    // there's a head start —
+    //   • the turn's final chunk has arrived (whole reply in hand → go), OR
+    //   • at least PREBUFFER_SECS of audio is buffered (a normal ~5-8 s
+    //     chunk 0 meets this instantly → zero added latency; it only
+    //     actually waits when chunk 0 is unusually short), OR
+    //   • PREBUFFER_DEADLINE elapsed since chunk 0 (don't stall forever on
+    //     a slow stream — accept a possible small gap over an indefinite
+    //     hang).
+    const PREBUFFER_SECS: f32 = 2.5;
+    const PREBUFFER_DEADLINE: Duration = Duration::from_millis(2500);
+    // No active turn → block on recv indefinitely (well, an hour — long
+    // enough that wakeups are negligible, short enough to never be a
+    // real "hang").
+    const IDLE_WAIT: Duration = Duration::from_secs(3600);
+
     // Open the default Windows audio output. cpal/WASAPI in this
     // process — Windows classifies as multimedia (NOT communications),
     // so no AGC / echo cancellation gets applied to TTS.
@@ -62,32 +140,81 @@ fn run_audio_worker(rx: std::sync::mpsc::Receiver<AudioCmd>) {
             return;
         }
     };
+
     let mut current_turn: Option<String> = None;
     let mut sink: Option<rodio::Sink> = None;
-    // (turn_id, seq) of chunks already appended to the current sink.
-    // Multiple windows / multiple WS clients each fire `play_audio_native`
-    // for the same broadcast Audio frame; without this dedupe set we
-    // append the same WAV to the sink twice (or more) and rodio plays
-    // it back twice. Cleared on turn change so we don't grow forever.
+    // seq of chunks already accepted for the current turn. Multiple
+    // windows / WS clients each fire `play_audio_native` for the same
+    // broadcast frame; without this dedupe set we'd queue (and play) the
+    // same WAV more than once. seq is unique within a turn; cleared on
+    // turn change so it doesn't grow forever.
     let mut seen_chunks: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // Opening chunks held back until the prebuffer condition is met, in
+    // arrival order. Drained into the Sink (in order) once we start.
+    let mut pending: Vec<Vec<u8>> = Vec::new();
+    let mut pending_secs: f32 = 0.0;
+    let mut playing = false; // has playback for the current turn started?
+    let mut last_seen = false; // got the chunk flagged last=true?
+    let mut first_chunk_at: Option<Instant> = None;
 
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            AudioCmd::Stop => {
-                sink = None;
-                current_turn = None;
-                seen_chunks.clear();
+    // Wipe per-turn state (the sink + its queue, the dedupe set, the
+    // prebuffer). Caller sets `current_turn` afterward.
+    macro_rules! reset_turn {
+        () => {{
+            sink = None;
+            seen_chunks.clear();
+            pending.clear();
+            pending_secs = 0.0;
+            playing = false;
+            last_seen = false;
+            first_chunk_at = None;
+        }};
+    }
+
+    let start_playback = |sink: &mut Option<rodio::Sink>, pending: &mut Vec<Vec<u8>>| -> bool {
+        if pending.is_empty() {
+            return false;
+        }
+        if sink.is_none() {
+            match rodio::Sink::try_new(&handle) {
+                Ok(s) => *sink = Some(s),
+                Err(e) => {
+                    tracing::error!("companion-audio: sink alloc: {e}");
+                    pending.clear();
+                    return false;
+                }
             }
-            AudioCmd::Play {
-                wav_bytes,
-                turn_id,
-                seq,
-            } => {
+        }
+        if let Some(s) = sink.as_ref() {
+            let n = pending.len();
+            for (i, bytes) in pending.drain(..).enumerate() {
+                append_wav(s, bytes, "(prebuffer)", i as u32);
+            }
+            tracing::info!("companion-audio: playback started ({n} chunk(s) prebuffered)");
+        }
+        true
+    };
+
+    loop {
+        // Wake at the prebuffer deadline if a turn is mid-buffer, else
+        // just block.
+        let wait = match (playing, first_chunk_at) {
+            (false, Some(t0)) => PREBUFFER_DEADLINE
+                .saturating_sub(t0.elapsed())
+                .max(Duration::from_millis(1)),
+            _ => IDLE_WAIT,
+        };
+
+        match rx.recv_timeout(wait) {
+            Ok(AudioCmd::Stop) => {
+                reset_turn!();
+                current_turn = None;
+            }
+            Ok(AudioCmd::Play { wav_bytes, turn_id, seq, last }) => {
                 if current_turn.as_deref() != Some(&turn_id) {
                     // New turn — drop the previous sink (and its queue)
                     // so we don't carry over chunks from a stale reply.
-                    sink = None;
-                    seen_chunks.clear();
+                    reset_turn!();
                     current_turn = Some(turn_id.clone());
                 }
                 if !seen_chunks.insert(seq) {
@@ -97,32 +224,53 @@ fn run_audio_worker(rx: std::sync::mpsc::Receiver<AudioCmd>) {
                     );
                     continue;
                 }
-                if sink.is_none() {
-                    sink = match rodio::Sink::try_new(&handle) {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            tracing::error!("companion-audio: sink alloc: {e}");
-                            continue;
-                        }
-                    };
+                if last {
+                    last_seen = true;
                 }
-                let bytes_len = wav_bytes.len();
-                let cursor = std::io::Cursor::new(wav_bytes);
-                match rodio::Decoder::new_wav(cursor) {
-                    Ok(source) => {
-                        if let Some(ref s) = sink {
-                            s.append(source);
-                            tracing::info!(
-                                "companion-audio: queued chunk turn={turn_id} seq={seq} bytes={bytes_len} sink_len={}",
-                                s.len(),
-                            );
+                // Empty bytes = end-of-turn terminator (no trailing
+                // audio). Don't queue it; it just means "flush what
+                // you have and finish".
+                if !wav_bytes.is_empty() {
+                    if playing {
+                        if let Some(s) = sink.as_ref() {
+                            if append_wav(s, wav_bytes, &turn_id, seq) {
+                                tracing::warn!(
+                                    "companion-audio: queue underran before turn={turn_id} seq={seq} (audio gap)"
+                                );
+                            }
                         }
+                    } else {
+                        if first_chunk_at.is_none() {
+                            first_chunk_at = Some(Instant::now());
+                        }
+                        pending_secs += wav_secs(&wav_bytes);
+                        pending.push(wav_bytes);
                     }
-                    Err(e) => {
-                        tracing::warn!("companion-audio: wav decode: {e}");
+                }
+                if !playing {
+                    let ready = last_seen
+                        || pending_secs >= PREBUFFER_SECS
+                        || first_chunk_at.map(|t| t.elapsed() >= PREBUFFER_DEADLINE).unwrap_or(false);
+                    if ready && start_playback(&mut sink, &mut pending) {
+                        playing = true;
                     }
                 }
             }
+            Err(RecvTimeoutError::Timeout) => {
+                // Prebuffer deadline reached while still waiting for more
+                // chunks — start with whatever we've got rather than
+                // stalling a slow stream.
+                if !playing && !pending.is_empty() {
+                    tracing::debug!(
+                        "companion-audio: prebuffer deadline hit ({:.1}s buffered), starting",
+                        pending_secs
+                    );
+                    if start_playback(&mut sink, &mut pending) {
+                        playing = true;
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 }
@@ -320,6 +468,7 @@ fn play_audio_native(
     audio_b64: String,
     turn_id: String,
     seq: u32,
+    last: bool,
 ) -> Result<(), String> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
@@ -331,6 +480,7 @@ fn play_audio_native(
             wav_bytes: bytes,
             turn_id,
             seq,
+            last,
         })
         .map_err(|e| format!("audio worker gone: {e}"))
 }

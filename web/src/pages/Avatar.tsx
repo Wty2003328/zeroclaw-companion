@@ -742,8 +742,14 @@ export default function Avatar() {
         currentTurnRef.current = turnId;
       }
 
-      // Empty audio = server signaled `last` for a failed chunk.
+      // Empty audio = server's end-of-turn terminator (or a failed
+      // chunk it still flagged `last`). Forward it to the native worker
+      // so its jitter buffer flushes + marks the turn done; the WebView
+      // path just clears "speaking" state.
       if (!audioBase64) {
+        if (nativeAudioAvailable()) {
+          void playAudioNative('', turnId, seq, last).catch(() => {});
+        }
         if (!drainingRef.current && audioQueueRef.current.length === 0) {
           setIsPlaying(false);
         }
@@ -759,7 +765,7 @@ export default function Avatar() {
       if (nativeAudioAvailable()) {
         // eslint-disable-next-line no-console
         console.log('[audio] → rodio (native)', { turnId, seq, last, bytes: audioBase64.length });
-        void playAudioNative(audioBase64, turnId, seq).then(() => {
+        void playAudioNative(audioBase64, turnId, seq, last).then(() => {
           // eslint-disable-next-line no-console
           console.log('[audio] rodio invoke OK', { turnId, seq });
           // rodio's Sink doesn't emit a JS-visible "ended" event; we
@@ -924,12 +930,14 @@ export default function Avatar() {
           const body: { reply?: string } = await resp.json();
           if (body.reply) {
             const candidate = body.reply;
-            // Bump the turn counter; the WS onText handler clears
-            // pendingHttpReplyRef.current when it receives the next
-            // Text frame for this turn. If the ref is still set after
-            // 8s, the WS missed it and we fall back to the raw text.
-            // 8s is the longest wait we've seen between /api/chat
-            // returning and the corresponding WS Text frame arriving.
+            // The WS Text frame is the preferred source — it's now
+            // emitted *with the first audio chunk* (so the bubble +
+            // subtitle land in sync with the voice, not ~10-20s ahead).
+            // That means we must wait through the translate + first-chunk
+            // synth before assuming the WS missed it. This timeout is a
+            // last-resort backstop for a genuinely dropped WS connection;
+            // onText clears pendingHttpReplyRef the moment the real frame
+            // arrives, cancelling it.
             pendingHttpReplyRef.current = candidate;
             setTimeout(() => {
               if (pendingHttpReplyRef.current !== candidate) {
@@ -939,7 +947,7 @@ export default function Avatar() {
               httpFallbackFiredRef.current = candidate;
               console.log('[chat] +assistant (HTTP fallback — WS missed)');
               appendTurn({ role: 'assistant', text: candidate, ts: Date.now() });
-            }, 8000);
+            }, 30000);
           }
         } catch { /* not JSON or already consumed; non-fatal */ }
       }
