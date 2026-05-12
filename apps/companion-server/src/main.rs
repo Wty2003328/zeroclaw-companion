@@ -1439,6 +1439,16 @@ async fn handle_post_zeroclaw_override(
     Ok(axum::http::StatusCode::OK)
 }
 
+/// Wrapper put in front of the active character's persona text before it's
+/// sent to the agent. Vanilla zeroclaw/openclaw/hermes have no per-request
+/// persona switch (see docs/PLAN-PERSONA-CONSOLE.md — deferred), so the
+/// companion delivers the character as a prompt prefix; this preamble tells
+/// the model that the character outranks whatever identity/SOUL.md the agent
+/// itself was built with. Scoped to *identity/voice* only — the agent keeps
+/// its tools, safety rules, and workspace instructions.
+const PERSONA_OVERRIDE_PREAMBLE: &str = "[Persona override — applies for this whole conversation]\n\
+You may already have an identity, persona, or \"soul\" (a SOUL.md, a system prompt, a name like ZeroClaw / Kulukai / \"an AI agent\" / \"an assistant\", …). For THIS conversation, set all of that aside for the purposes of *who you are and how you speak* — the character described below replaces it. Keep everything else (your tools, capabilities, and operating instructions) exactly as they are; only your identity and voice come from the character. Never mention, hint at, or slip back into that earlier identity. If asked who or what you are, you are the character below — nothing else.";
+
 #[derive(serde::Deserialize)]
 struct ChatRequest {
     message: String,
@@ -1490,12 +1500,12 @@ async fn handle_chat(
         let _ = avatar.event_tx.send(frame);
     }
 
-    // Prepend the active character's system prompt (if any) before
-    // sending to zeroclaw. This is the load-bearing way to switch
-    // personas without modifying zeroclaw's config — we just frame
-    // each user message with "[Character] ... User: <msg>". Failure
-    // to load the characters file is non-fatal: we just send the raw
-    // message.
+    // Prepend the active character's persona before sending to the agent.
+    // This is the load-bearing way to set a persona without touching the
+    // agent's config — we frame each user message with an override preamble
+    // + the character text + the actual message. `PERSONA_OVERRIDE_PREAMBLE`
+    // tells the model the character outranks its built-in identity/SOUL.md.
+    // Failure to load the characters file is non-fatal: send the raw message.
     let outbound = match characters::load(&characters::characters_path(&state.config_path)) {
         Ok(file) => match characters::active(&file) {
             Some(c) => {
@@ -1508,7 +1518,12 @@ async fn handle_chat(
                         c.name,
                         prefix.len(),
                     );
-                    format!("{}\n\nUser message: {}", prefix, req.message)
+                    format!(
+                        "{preamble}\n\n=== CHARACTER ===\n{prefix}\n=== END CHARACTER ===\n\nStay fully in character as described above. Now reply to:\n\nUser message: {msg}",
+                        preamble = PERSONA_OVERRIDE_PREAMBLE,
+                        prefix = prefix,
+                        msg = req.message,
+                    )
                 }
             }
             _ => req.message.clone(),
