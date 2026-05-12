@@ -195,6 +195,7 @@ export default function Settings() {
         {cfg?.avatar?.subagent && (
           <SubagentEditor
             current={cfg.avatar.subagent}
+            onSaved={reloadCfg}
             tomlHintDismissed={tomlHintDismissed}
             onDismissHint={() => {
               setTomlHintDismissed(true);
@@ -1004,9 +1005,10 @@ function AvatarEditor({
 type Backend = 'direct' | 'webhook';
 
 function SubagentEditor({
-  current, tomlHintDismissed, onDismissHint,
+  current, onSaved, tomlHintDismissed, onDismissHint,
 }: {
   current: AvatarConfigView['subagent'];
+  onSaved: () => void;
   tomlHintDismissed: boolean;
   onDismissHint: () => void;
 }) {
@@ -1075,6 +1077,11 @@ function SubagentEditor({
       }
       setSavedAt(Date.now());
       setApiKey('');
+      // Re-fetch /api/config so `current` reflects the just-saved values —
+      // otherwise `dirty` stays true (current vs. local-state mismatch) and
+      // the "unsaved changes" indicator + Apply button never clear, which
+      // makes a successful save look like it did nothing.
+      onSaved();
       // The server hot-swapped the subagent in-place. Fade the
       // "Applied" hint after 4s so it doesn't linger.
       setTimeout(() => setSavedAt(null), 4000);
