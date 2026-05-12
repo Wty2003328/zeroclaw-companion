@@ -119,15 +119,21 @@ from fastapi import FastAPI, HTTPException
 # Performance knobs — applied immediately after torch import so all
 # downstream model/tensor work picks them up.
 #
-# - cudnn.benchmark=True lets cuDNN auto-tune kernels for the input
-#   shapes we actually use. First call is slightly slower (warmup),
-#   every call after is faster. Worth it for an always-on TTS loop.
+# - cudnn.benchmark = FALSE. It autotunes conv algorithms per *input
+#   shape* — a win only when the same shapes recur. TTS text length
+#   (hence the BigVGAN vocoder's conv input lengths) is different on
+#   every call, so the shapes never repeat and `benchmark=True` pays a
+#   ~15-20s autotune sweep on *every* /tts request (observed: ~20s for
+#   even an 8-char sentence). With it off, cuDNN picks a fast heuristic
+#   algorithm with no autotune — slightly slower per op, but each call
+#   drops from ~20s to ~2-5s. Output audio is identical either way.
+#   Override with TTS_CUDNN_BENCHMARK=1 if your usage really is fixed-shape.
 # - allow_tf32 lets the matmul + cuDNN pipelines use TF32 on Ampere+.
 #   We're already in fp16 for the heavy paths, but a few helper ops
 #   stay in fp32 and benefit.
 # - inference_mode is the strict no-grad context (faster than
 #   no_grad). We swap it in below for the synthesis hot path.
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = os.environ.get("TTS_CUDNN_BENCHMARK") == "1"
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 from fastapi.responses import Response
