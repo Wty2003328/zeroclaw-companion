@@ -1,6 +1,11 @@
-"""Navigate to /settings, snap, and exercise the avatar override save."""
-import json, base64, sys, time, urllib.request
+"""Navigate to /settings, snap, and exercise the avatar override save.
+
+Screenshots are written next to this script as `_tauri_*.png`.
+"""
+import json, base64, os, sys, time, urllib.request
 from websocket import create_connection  # type: ignore
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def find_main():
     ts = json.load(urllib.request.urlopen("http://127.0.0.1:9222/json/list", timeout=5))
@@ -19,7 +24,7 @@ def shoot(ws, mid, name):
     res = call(ws, mid, "Page.captureScreenshot", {"format": "png"})
     data = res.get("result", {}).get("data")
     if data:
-        out = f"C:/Users/user/Desktop/workspace/waifu-companion/scripts/_tauri_{name}.png"
+        out = os.path.join(SCRIPT_DIR, f"_tauri_{name}.png")
         open(out, "wb").write(base64.b64decode(data))
         print("wrote", out)
 

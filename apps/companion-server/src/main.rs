@@ -1367,7 +1367,8 @@ struct ZeroclawOverrideRequest {
     /// Empty / missing leaves the saved value alone. Unknown values fall
     /// through to "zeroclaw" (defensive — Settings only sends valid ids).
     kind: Option<String>,
-    /// Base URL of the agent gateway (e.g. http://192.168.1.100:42617).
+    /// Base URL of the agent gateway (e.g. http://127.0.0.1:42617 for a
+    /// same-host install, or http://<lan-ip>:42617 for a home-server setup).
     url: Option<String>,
     /// Pairing/bearer token. Empty string clears it.
     pair_token: Option<String>,

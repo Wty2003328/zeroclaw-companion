@@ -1,0 +1,53 @@
+{
+  "_comment": "Runtime overrides written by the Settings UI. Copy to companion.runtime.json (gitignored). Every field is OPTIONAL — null means 'fall back to whatever companion.toml says'. Strings here override the toml at startup.",
+
+  "avatar": {
+    "enabled": true,
+    "chat_language": "en",
+    "subagent_enabled": null,
+    "subagent_only_when_translating": null,
+    "subagent_streaming": null,
+    "tts_language": null,
+    "tts_speed": 1.0,
+    "tts_voice": null,
+    "tts_quality": "balanced",
+    "tts_streaming": null,
+    "tts_api_url": null,
+    "tts_launcher_command": null
+  },
+
+  "subagent": {
+    "use_zeroclaw_webhook": false,
+    "api_key": "REPLACE_ME_OR_USE_OPENAI_API_KEY_ENV_VAR",
+    "model": "gpt-4o-mini",
+    "base_url": "https://api.openai.com/v1",
+    "timeout_secs": 30,
+    "disable_thinking": false,
+    "enabled": null,
+    "only_when_translating": null,
+    "streaming": null,
+    "translator": {
+      "backend": null,
+      "url": null,
+      "http_timeout_secs": null,
+      "nmt_quality_preset": null,
+      "nmt_model_id": null,
+      "nmt_num_beams": null,
+      "nmt_device": null,
+      "nmt_precision": null,
+      "nmt_src_lang": null,
+      "nmt_tgt_lang": null,
+      "nmt_launch_command": null,
+      "nmt_auto_start": null,
+      "nmt_close_with_companion": null,
+      "nmt_port": null
+    }
+  },
+
+  "zeroclaw": {
+    "kind": "zeroclaw",
+    "url": "http://127.0.0.1:42617",
+    "pair_token": null,
+    "timeout_secs": 300
+  }
+}

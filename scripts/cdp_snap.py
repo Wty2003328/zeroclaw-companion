@@ -1,6 +1,11 @@
-"""Snap a screenshot of the main Tauri window via CDP and dump basic page state."""
-import json, base64, sys, urllib.request
+"""Snap a screenshot of the main Tauri window via CDP and dump basic page state.
+
+Screenshots are written next to this script as `_tauri_*.png`.
+"""
+import json, base64, os, sys, urllib.request
 from websocket import create_connection  # type: ignore
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def find_main():
     ts = json.load(urllib.request.urlopen("http://127.0.0.1:9222/json/list", timeout=5))
@@ -29,7 +34,7 @@ def main():
     shot = call(ws, 4, "Page.captureScreenshot", {"format": "png"})
     data = shot.get("result", {}).get("data")
     if data:
-        out = "C:/Users/user/Desktop/workspace/waifu-companion/scripts/_tauri_main.png"
+        out = os.path.join(SCRIPT_DIR, "_tauri_main.png")
         open(out, "wb").write(base64.b64decode(data))
         print("screenshot:", out)
     ws.close()
