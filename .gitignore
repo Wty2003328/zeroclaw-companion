@@ -53,3 +53,19 @@ CLAUDE.md
 # Tauri binaries (the sidecar is staged from target/release per build,
 # don't commit a stale copy). Real icons can stay tracked.
 /apps/companion-tauri/binaries/
+
+# Python bytecode (anywhere)
+__pycache__/
+*.pyc
+
+# Per-machine artifacts under tools/ — voice clones are user-supplied,
+# audio outputs are scratch from manual testing.
+tools/avatar/cloned_voices/
+
+# Test-rig outputs (audio samples, screenshots, logs). The rigs
+# themselves (tts_tools/) are tracked; their outputs in tts_samples/
+# are scratch only.
+/tts_samples/
+
+# Working / progress scratch docs — keep notes locally, not in git.
+POLISH_PROGRESS.md

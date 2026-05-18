@@ -61,14 +61,24 @@ impl AudioState {
 /// sink had run dry *before* this chunk landed (i.e. an audible gap
 /// just occurred) — informational only.
 fn append_wav(sink: &rodio::Sink, wav_bytes: Vec<u8>, turn_id: &str, seq: u32) -> bool {
+    use rodio::Source;
     let bytes_len = wav_bytes.len();
     let underran = sink.empty();
     match rodio::Decoder::new_wav(std::io::Cursor::new(wav_bytes)) {
         Ok(source) => {
+            // Diagnostic: how much audio do we actually have?
+            // If `total_duration` is None, rodio doesn't know — but
+            // sample-rate + channel info is always available. Any of
+            // these being 0 is a smoking gun for "sink appears full
+            // but plays silence".
+            let sr = source.sample_rate();
+            let ch = source.channels();
+            let dur_ms = source.total_duration().map(|d| d.as_millis() as i64).unwrap_or(-1);
             sink.append(source);
             tracing::info!(
-                "companion-audio: queued chunk turn={turn_id} seq={seq} bytes={bytes_len} sink_len={}",
-                sink.len(),
+                "companion-audio: queued chunk turn={turn_id} seq={seq} bytes={bytes_len} \
+                 source(sr={sr}Hz ch={ch} dur={dur_ms}ms) sink_len={} paused={} vol={:.2}",
+                sink.len(), sink.is_paused(), sink.volume(),
             );
         }
         Err(e) => tracing::warn!("companion-audio: wav decode (turn={turn_id} seq={seq}): {e}"),
@@ -133,6 +143,38 @@ fn run_audio_worker(rx: std::sync::mpsc::Receiver<AudioCmd>) {
     // Open the default Windows audio output. cpal/WASAPI in this
     // process — Windows classifies as multimedia (NOT communications),
     // so no AGC / echo cancellation gets applied to TTS.
+    //
+    // Diagnostic: log every available output device + which one cpal
+    // picked as default. Necessary because rodio's `try_default` can
+    // silently bind to a wrong device (HDMI to a powered-off monitor,
+    // disabled USB headset still listed first, "communication" default
+    // distinct from "multimedia" default on Windows) and the user hears
+    // nothing despite "playback started" appearing in our log.
+    {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        let host = cpal::default_host();
+        tracing::info!("companion-audio: cpal host = {:?}", host.id());
+        match host.default_output_device() {
+            Some(d) => {
+                let name = d.name().unwrap_or_else(|_| "(unknown)".into());
+                tracing::info!("companion-audio: default output device = {}", name);
+                if let Ok(cfg) = d.default_output_config() {
+                    tracing::info!(
+                        "companion-audio:   default config: {} ch, {} Hz, {:?}",
+                        cfg.channels(), cfg.sample_rate().0, cfg.sample_format()
+                    );
+                }
+            }
+            None => tracing::error!("companion-audio: NO default output device — that's the bug"),
+        }
+        if let Ok(devices) = host.output_devices() {
+            for (i, d) in devices.enumerate() {
+                let name = d.name().unwrap_or_else(|_| "(unknown)".into());
+                tracing::info!("companion-audio:   output[{i}] = {name}");
+            }
+        }
+    }
+
     let (_stream, handle) = match rodio::OutputStream::try_default() {
         Ok(pair) => pair,
         Err(e) => {
@@ -140,6 +182,12 @@ fn run_audio_worker(rx: std::sync::mpsc::Receiver<AudioCmd>) {
             return;
         }
     };
+
+    // (The startup audibility-probe tone lived here during the
+    // 2026-05-18 audio-device debug session. Removed after the issue
+    // was found — the cpal device enumeration above remains in case
+    // a future user hits the same "rodio playback started but silent"
+    // class of bug.)
 
     let mut current_turn: Option<String> = None;
     let mut sink: Option<rodio::Sink> = None;

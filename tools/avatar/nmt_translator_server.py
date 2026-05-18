@@ -122,7 +122,24 @@ def build_app(engine: NMTEngine) -> FastAPI:
 
         t0 = time.time()
         try:
-            out = engine.translate(req.text, src_lang=src_override)
+            # Preserve paragraph breaks across the model. NLLB/Marian
+            # collapse all whitespace when given a multi-paragraph
+            # input, but the companion's paragraph-wise TTS streamer
+            # NEEDS `\n\n` to fire — without it, the entire reply is
+            # synthesized as one chunk and the user only hears one
+            # paragraph's worth of audio. Translate each paragraph
+            # separately, rejoin with the same `\n\n` delimiter.
+            paragraphs = req.text.split("\n\n")
+            translated_paras: list[str] = []
+            for para in paragraphs:
+                para_stripped = para.strip()
+                if not para_stripped:
+                    translated_paras.append("")
+                    continue
+                translated_paras.append(
+                    engine.translate(para_stripped, src_lang=src_override)
+                )
+            out = "\n\n".join(translated_paras)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -132,7 +149,8 @@ def build_app(engine: NMTEngine) -> FastAPI:
         print(
             f"[nmt-translator] /translate "
             f"{effective_src}->{engine.config.tgt_lang} "
-            f"chars={len(req.text)} wall={time.time() - t0:.3f}s"
+            f"chars={len(req.text)} paragraphs={len(paragraphs)} "
+            f"wall={time.time() - t0:.3f}s"
         )
         return TranslateResponse(
             text=out,

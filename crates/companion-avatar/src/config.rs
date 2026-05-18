@@ -147,6 +147,10 @@ const ABBREVIATIONS: &[&str] = &[
 /// `.`) is something we should NOT treat as a sentence end. Strips
 /// leading/trailing punctuation first, so `(e.g.` → `e.g`, `"Mr.` →
 /// `mr`, `J.` → `j`.
+pub(crate) fn is_abbreviation_pub(word: &str) -> bool {
+    is_abbreviation(word)
+}
+
 fn is_abbreviation(word: &str) -> bool {
     let w = word
         .trim_start_matches(|c: char| !c.is_alphanumeric())

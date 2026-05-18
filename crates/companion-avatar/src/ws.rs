@@ -666,31 +666,29 @@ pub async fn process_speak(state: &Arc<AvatarWsState>, text: &str) -> Result<Str
         return Ok(subtitle_text);
     }
 
-    // Paragraph-chunked synthesis when streaming is enabled. All chunks
+    // Sentence-chunked synthesis when streaming is enabled. All chunks
     // of one turn share `turn_id` so the frontend can queue them
-    // sequentially without confusing them for stale audio. Most chat
-    // replies fit in a single paragraph → exactly one Audio frame, no
-    // intra-reply cold-start. Multi-paragraph replies stream one
-    // paragraph at a time, with the inter-paragraph cold-start gap
-    // landing at a `\n\n` boundary the listener already expects.
+    // sequentially without confusing them for stale audio.
     //
-    // If the upstream translator path produced multiple chunks already,
-    // we feed those to TTS directly (each chunk is its own synthesis
-    // unit). For a single bulk translation we split on `\n\n` when
-    // streaming is on; off → single shot the whole reply.
+    // History: `\n\n` paragraph splitting was tried (task #137) on the
+    // theory that "most chat replies are one paragraph anyway." That
+    // assumption is wrong — a typical LLM reply is one paragraph of
+    // several sentences. Paragraph splitting collapsed to single-shot
+    // synth and made the user wait for a 30-60s audio chunk before
+    // playback started. Even after fixing the NMT translator to
+    // preserve `\n\n`, single-paragraph replies still collapsed.
+    //
+    // Sentence-level splitting (via `split_sentences`, which is
+    // punctuation- and abbreviation-aware) targets ~80 chars per
+    // chunk = roughly 10-15 seconds of JA audio. Small enough to
+    // start playback fast; large enough to avoid hundreds of tiny
+    // synth calls. The Tauri audio worker's jitter buffer
+    // (rodio Sink + the prebuffer logic) smooths transitions.
+    //
+    // If upstream gave us pre-split chunks (LLM streaming sentence
+    // by sentence), we honour that and skip the secondary split.
     let turn_id = uuid::Uuid::new_v4().to_string();
-    let chunks: Vec<String> = if tts_chunks.len() > 1 {
-        tts_chunks
-    } else if cfg.tts.streaming {
-        let parts: Vec<String> = tts_text
-            .split("\n\n")
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if parts.is_empty() { vec![tts_text.clone()] } else { parts }
-    } else {
-        vec![tts_text.clone()]
-    };
+    let chunks = compute_tts_chunks(&tts_text, tts_chunks, cfg.tts.streaming);
     let total = chunks.len();
     tracing::info!(
         "avatar: tts streaming={} chunks={} turn_id={}",
@@ -811,25 +809,158 @@ async fn send_notification(
 /// a whole thought, and the inter-paragraph cold-start gap is naturally
 /// large enough (an LLM "double newline" usually signals a topic shift)
 /// that listeners forgive it.
+/// Decide how to chunk a TTS-bound reply for streaming.
+///
+/// History: `\n\n` paragraph splitting was tried (task #137) on the
+/// theory that "most chat replies are one paragraph anyway." That
+/// assumption is wrong — a typical LLM reply is one paragraph of
+/// several sentences. Paragraph splitting collapsed to single-shot
+/// synth and made the user wait for a 30-60s audio chunk before
+/// playback started, AND made VITS-style engines stutter on the
+/// long input.
+///
+/// Sentence-level splitting (via `split_sentences`, which is
+/// punctuation- and abbreviation-aware) targets ~80 chars per
+/// chunk = roughly 10-15 seconds of JA audio. Small enough to
+/// start playback fast; large enough to avoid hundreds of tiny
+/// synth calls. The Tauri audio worker's jitter buffer
+/// (rodio Sink + the prebuffer logic) smooths transitions.
+///
+/// If `pre_chunked` already has >1 entries (LLM streaming sentence
+/// by sentence emitted them), we honour that and skip our split.
+pub fn compute_tts_chunks(
+    tts_text: &str,
+    pre_chunked: Vec<String>,
+    streaming: bool,
+) -> Vec<String> {
+    // target=40 chars ≈ 1-2 short sentences or 1 long sentence per
+    // chunk. With JA ~5 chars/s of speech, that's ~8s of audio per
+    // chunk — small enough that the first sound starts fast, large
+    // enough to avoid hundreds of synth calls per turn. target=80
+    // was too eager: 6 short JA sentences packed into 2 chunks of
+    // ~30s each, defeating the streaming intent and pushing each
+    // chunk back into VITS's stutter zone.
+    const TTS_SENT_TARGET: usize = 40;
+    if pre_chunked.len() > 1 {
+        return pre_chunked;
+    }
+    if !streaming {
+        return vec![tts_text.to_string()];
+    }
+    let parts = crate::config::split_sentences(tts_text, TTS_SENT_TARGET);
+    if parts.is_empty() {
+        vec![tts_text.to_string()]
+    } else {
+        parts
+    }
+}
+
 fn pop_first_paragraph(buf: &mut String) -> Option<String> {
+    // First try a sentence-boundary pop — that's the granularity we
+    // actually want for streaming TTS. Falls back to `\n\n` paragraph
+    // boundaries when there's no sentence terminator yet but the
+    // upstream stream emitted a paragraph break (rare).
+    //
+    // Why this matters: NMT (NLLB) returns the full translation as a
+    // single stream delta with no `\n\n` markers. Without the
+    // sentence-level fallback, the whole reply accumulated in `buf`
+    // until the stream ended, then dispatched as ONE chunk via the
+    // "leftover" branch in the streaming pipeline. The user heard
+    // only the first part of a 30-60s synth before SBV2's attention
+    // drifted on the long input.
+    if let Some(s) = pop_first_sentence(buf) {
+        return Some(s);
+    }
     loop {
         let idx = buf.find("\n\n")?;
-        // Split off the prefix; advance past the `\n\n` separator.
         let prefix = buf[..idx].trim().to_string();
         let rest = buf[idx + 2..].to_string();
         *buf = rest;
         if !prefix.is_empty() {
-            // Drain any leading `\n` runs left over from a stacked
-            // separator (`\n\n\n\n` = two separators back-to-back) so
-            // the caller's buffer doesn't carry spurious whitespace into
-            // the next paragraph.
             *buf = buf.trim_start_matches('\n').to_string();
             return Some(prefix);
         }
-        // Empty paragraph (consecutive `\n\n\n...` runs) — keep looping
-        // so we drain all stacked separators in one call instead of
-        // returning Some("") which the caller would have to filter.
     }
+}
+
+/// Drain the first complete sentence from `buf`. Recognises ASCII
+/// terminators (`.!?`), CJK terminators (`。！？`), and `\n\n`. A `.`
+/// only counts as a sentence end if it's NOT preceded by a known
+/// abbreviation (`Mr.`, `e.g.`, etc.) — same abbreviation list as
+/// `config::raw_sentences`.
+///
+/// Returns None if there's no complete sentence yet (the buffer is
+/// still being filled by an in-flight stream delta).
+fn pop_first_sentence(buf: &mut String) -> Option<String> {
+    let s = buf.as_str();
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Walk by char so we never split a multi-byte codepoint.
+        let c = s[i..].chars().next()?;
+        let c_len = c.len_utf8();
+        let is_end = matches!(c, '.' | '!' | '?' | '。' | '！' | '？' | '\n');
+        if is_end {
+            // For ASCII `.`, defer if it's part of an abbreviation
+            // (Mr., e.g., …) — we'd otherwise emit "Hi Mr" without
+            // its trailing context.
+            let is_period = c == '.';
+            let in_ellipsis = is_period
+                && (s.as_bytes().get(i + c_len) == Some(&b'.')
+                    || s.as_bytes().get(i.saturating_sub(1)) == Some(&b'.'));
+            if in_ellipsis {
+                i += c_len;
+                continue;
+            }
+            if is_period {
+                // Look back to the start of the word ending here.
+                let word_start = s[..i]
+                    .char_indices()
+                    .rev()
+                    .find(|&(_, ch)| ch.is_whitespace())
+                    .map(|(idx, ch)| idx + ch.len_utf8())
+                    .unwrap_or(0);
+                let word = &s[word_start..i];
+                if crate::config::is_abbreviation_pub(word) {
+                    i += c_len;
+                    continue;
+                }
+                // Decimal: digit . digit
+                let prev = s[..i].chars().next_back();
+                let next = s[i + c_len..].chars().next();
+                if prev.map_or(false, |p| p.is_ascii_digit())
+                    && next.map_or(false, |n| n.is_ascii_digit())
+                {
+                    i += c_len;
+                    continue;
+                }
+            }
+            // Found a real sentence end. Pull in trailing close-quotes
+            // / parens / CJK closers.
+            let mut end = i + c_len;
+            while end < bytes.len() {
+                let nc = match s[end..].chars().next() {
+                    Some(c) => c,
+                    None => break,
+                };
+                if matches!(nc, '"' | '\'' | ')' | ']' | '}' | '」' | '』' | '）') {
+                    end += nc.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let sentence = s[..end].trim().to_string();
+            let remainder = s[end..].trim_start().to_string();
+            *buf = remainder;
+            if sentence.is_empty() {
+                // A leading `\n` with no preceding content — keep going.
+                return pop_first_sentence(buf);
+            }
+            return Some(sentence);
+        }
+        i += c_len;
+    }
+    None
 }
 
 /// Streaming pipeline. Bcasts initial Expression/Text/Debug, then
@@ -1288,11 +1419,26 @@ mod pop_first_paragraph_tests {
 
     #[test]
     fn no_double_newline_returns_none() {
-        // Single sentence, single newline — not a paragraph boundary.
+        // Pre-2026-05-18: pop_first_paragraph ONLY split on `\n\n`,
+        // so this case returned None and the entire turn waited for an
+        // explicit paragraph break that NMT never emitted. That bug
+        // caused the user to hear only one chunk of a multi-sentence
+        // reply (the "leftover" fell out as one chunk at the end of
+        // the stream). Updated to test the new semantics: with a
+        // sentence terminator present, we pop the sentence, leaving
+        // the partial trailing fragment in `buf` for the next delta.
         let mut buf = String::from("Hello there.\nNo paragraph break here yet");
+        let p = pop_first_paragraph(&mut buf).expect("sentence present");
+        assert_eq!(p, "Hello there.");
+        assert_eq!(buf, "No paragraph break here yet");
+    }
+
+    #[test]
+    fn no_terminator_at_all_returns_none() {
+        // No sentence terminator AND no `\n\n` → wait for more delta.
+        let mut buf = String::from("a partial fragment of text");
         assert!(pop_first_paragraph(&mut buf).is_none());
-        // Buffer must be untouched so the next delta can append.
-        assert_eq!(buf, "Hello there.\nNo paragraph break here yet");
+        assert_eq!(buf, "a partial fragment of text");
     }
 
     #[test]
@@ -1349,5 +1495,174 @@ mod pop_first_paragraph_tests {
         let p = pop_first_paragraph(&mut buf).expect("paragraph present");
         assert_eq!(p, "こんにちは、元気ですか？");
         assert_eq!(buf, "今日もいい天気ですね。");
+    }
+}
+
+#[cfg(test)]
+mod compute_tts_chunks_tests {
+    use super::compute_tts_chunks;
+
+    // The original bug: a 4-sentence single-paragraph JA reply collapsed
+    // to one TTS chunk because the splitter looked for \n\n and there
+    // were none. The user heard only ~30s of audio, then nothing.
+    // With sentence-level splitting via split_sentences(target=80) this
+    // single-paragraph input MUST produce multiple chunks.
+    #[test]
+    fn long_single_paragraph_multi_sentence_japanese_yields_multiple_chunks() {
+        let reply = concat!(
+            "こんにちは、今日はとても良い天気ですね。",
+            "公園を散歩していると、桜の花がきれいに咲いていて、心が癒されました。",
+            "近くのカフェで温かいコーヒーを飲みながら、しばらく本を読んでいました。",
+            "夕方になると、空がきれいなオレンジ色に染まり、思わず写真を撮りたくなりました。",
+            "今夜は家で美味しい料理を作って、ゆっくり過ごす予定です。",
+            "明日もきっと素敵な一日になりますように。",
+        );
+        // No \n\n in the input — the old paragraph splitter would have
+        // returned exactly one chunk, the bug we hit on 2026-05-18.
+        assert!(!reply.contains("\n\n"));
+        let chunks = compute_tts_chunks(reply, Vec::new(), true);
+        assert!(
+            chunks.len() >= 3,
+            "expected >=3 chunks for a 6-sentence input, got {}: {:?}",
+            chunks.len(), chunks,
+        );
+    }
+
+    // Even with paragraph breaks, the sentence-splitter should still
+    // pick natural boundaries — never producing fewer chunks than the
+    // paragraph splitter would have.
+    #[test]
+    fn multi_paragraph_english_yields_multiple_chunks() {
+        let reply = "Hello, how are you today? The weather is great.\n\n\
+                     Let me tell you about Mochi the cat. She lives by the seaside.\n\n\
+                     Every day she chases butterflies and falls asleep in the sun.";
+        let chunks = compute_tts_chunks(reply, Vec::new(), true);
+        assert!(
+            chunks.len() >= 3,
+            "expected >=3 chunks for a 3-paragraph input, got {}: {:?}",
+            chunks.len(), chunks,
+        );
+    }
+
+    // Streaming OFF must always be one chunk regardless of content.
+    #[test]
+    fn streaming_off_yields_single_chunk() {
+        let reply = "Sentence one. Sentence two. Sentence three. Sentence four.";
+        let chunks = compute_tts_chunks(reply, Vec::new(), false);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], reply);
+    }
+
+    // Pre-chunked input from upstream (LLM streaming sentence-by-sentence)
+    // must be honoured verbatim — no re-splitting.
+    #[test]
+    fn pre_chunked_is_honoured_verbatim() {
+        let pre = vec![
+            "Sentence A.".to_string(),
+            "Sentence B.".to_string(),
+            "Sentence C.".to_string(),
+        ];
+        let chunks = compute_tts_chunks("ignored", pre.clone(), true);
+        assert_eq!(chunks, pre);
+    }
+
+    // Trivial input must still produce one chunk, not zero.
+    #[test]
+    fn short_input_yields_at_least_one_chunk() {
+        let chunks = compute_tts_chunks("Hi.", Vec::new(), true);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], "Hi.");
+    }
+
+    // Empty after trim must still return one chunk — caller decides
+    // whether to skip the speak path entirely.
+    #[test]
+    fn empty_after_trim_still_yields_one_chunk() {
+        let chunks = compute_tts_chunks("   \n  ", Vec::new(), true);
+        // split_sentences returns empty for whitespace-only; we fall back.
+        assert_eq!(chunks.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod pop_first_sentence_tests {
+    use super::pop_first_paragraph;
+
+    // The bug we just hit on 2026-05-18: NMT streams the full JA
+    // translation as one delta with no `\n\n`. The old pop logic
+    // returned None, so the whole text dispatched as one chunk via
+    // the leftover branch. Now it should pop sentence by sentence.
+    #[test]
+    fn drains_multiple_japanese_sentences_without_paragraph_breaks() {
+        let mut buf = String::from(
+            "こんにちは。今日はとても良い天気ですね。\
+             公園を散歩していると、桜の花がきれいに咲いていました。\
+             夕方になると、空がきれいなオレンジ色に染まりました。"
+        );
+        let mut popped = Vec::new();
+        while let Some(s) = pop_first_paragraph(&mut buf) {
+            popped.push(s);
+        }
+        assert!(
+            popped.len() >= 3,
+            "expected >=3 sentences popped, got {}: {:?}",
+            popped.len(), popped
+        );
+        // Buf should be empty (all sentences ended with terminator).
+        assert!(buf.trim().is_empty(), "leftover in buf: {:?}", buf);
+    }
+
+    #[test]
+    fn drains_english_sentences_without_paragraph_breaks() {
+        let mut buf = String::from(
+            "Hello. How are you? I am fine. Today is sunny."
+        );
+        let mut popped = Vec::new();
+        while let Some(s) = pop_first_paragraph(&mut buf) {
+            popped.push(s);
+        }
+        assert_eq!(popped.len(), 4, "got: {:?}", popped);
+    }
+
+    #[test]
+    fn defers_on_abbreviation() {
+        // `Mr.` must NOT pop as a sentence by itself — wait for the
+        // real terminator. Otherwise the streaming dispatcher would
+        // synthesize "Hi Mr" alone.
+        let mut buf = String::from("Hi Mr. Smith. Welcome.");
+        let first = pop_first_paragraph(&mut buf).expect("should pop the full first sentence");
+        assert_eq!(first, "Hi Mr. Smith.");
+        let second = pop_first_paragraph(&mut buf).expect("welcome");
+        assert_eq!(second, "Welcome.");
+        assert!(pop_first_paragraph(&mut buf).is_none());
+    }
+
+    #[test]
+    fn defers_on_incomplete_sentence() {
+        // No terminator yet → return None, wait for the next delta.
+        let mut buf = String::from("This is not done yet, hold on");
+        assert!(pop_first_paragraph(&mut buf).is_none());
+        // Buffer untouched.
+        assert_eq!(buf, "This is not done yet, hold on");
+    }
+
+    #[test]
+    fn handles_decimal_points() {
+        // `3.14` is not a sentence end. `is enough.` IS.
+        let mut buf = String::from("Pi is roughly 3.14 which is enough. Next.");
+        let first = pop_first_paragraph(&mut buf).expect("first");
+        assert_eq!(first, "Pi is roughly 3.14 which is enough.");
+        let second = pop_first_paragraph(&mut buf).expect("second");
+        assert_eq!(second, "Next.");
+    }
+
+    #[test]
+    fn paragraph_break_still_works_when_no_sentence_terminator() {
+        // A delta with explicit `\n\n` but no `.`/`。` should still pop
+        // (the paragraph-break fallback).
+        let mut buf = String::from("Some text here\n\nmore content");
+        let first = pop_first_paragraph(&mut buf).expect("para");
+        assert_eq!(first, "Some text here");
+        assert!(pop_first_paragraph(&mut buf).is_none());
     }
 }

@@ -43,6 +43,11 @@ anyhow = "1"
 # untouched. Frontend invokes us via tauri::command instead of using
 # its <video> element when the host is Tauri.
 rodio = { version = "0.20", default-features = false, features = ["wav", "hound"] }
+# cpal is rodio's underlying audio backend. Pulled in directly so the
+# audio worker can enumerate output devices for diagnostic logging
+# (matches rodio 0.20's transitive cpal version to avoid duplicate
+# crates in the dep tree).
+cpal = "0.15"
 base64 = "0.22"
 # Tiny blocking HTTP client used during graceful shutdown — calls
 # companion-server's POST /api/shutdown and polls /health from a std

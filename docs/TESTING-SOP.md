@@ -549,7 +549,21 @@ Outputs:
 - `tts_samples/run_all/<timestamp>/<suite>.log` — full stdout+stderr.
 - Exit non-zero if any suite failed.
 
-## L7 — Tauri shell smoke (≈2 min, manual unless we wire CDP)
+## L7 — Tauri shell smoke (≈90s, automated via CDP)
+
+Wired as `tts_tools/test_tauri_shell.py`. Build + launch
+companion-tauri with --features custom-protocol; attach via the
+WebView2 CDP port (env: `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9223 --remote-allow-origins=*`);
+assert main window renders the nav + #root has children + backend
+reachable; close via WM_CLOSE (the same signal as clicking X);
+verify all sidecar ports (9181/9881/9891) released within 10s.
+
+Caught the iter-12 leak class on 2026-05-18: NMT translator sidecar
+(:9881) survived a WM_CLOSE on the Tauri main window — companion-server
++ SBV2 cleaned up, but the NMT TranslatorManager's shutdown path was
+missing. Manual L7 had let this slip for weeks.
+
+## L7-deprecated — Tauri shell smoke (legacy manual checklist)
 
 ```bash
 # 1. Build with the right feature flag — without --features
